@@ -7,4 +7,6 @@
 /wandb
 **/*.bmp
 **/*.png
-**/*.jpg    
+**/*.jpg
+/ExtraData
+**/*.pyc

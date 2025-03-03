@@ -10,6 +10,192 @@ from tools.datasets.augments import train_transform, valid_transform
 from configs.option import get_option
 
 
+def degrade_image(image, scale=2, output_shape=(448, 800)):
+    """
+    接受一张高分辨率(HR)图像，应用随机的退化操作生成对应的低分辨率(LR)图像。
+    支持多种降采样比例、盲退化方式和数据增强，输入和输出格式可灵活选择。
+    参数:
+        image: 输入的HR图像。可以是PIL.Image对象、NumPy数组或torch.Tensor。
+        scale: 降采样比例，例如2、4、8等。
+        output_shape: 输出HR图像大小，格式为(H, W)。默认为(448, 800)。
+    返回:
+        (hr_image, lr_image): 元组，其中第一个是处理后的HR图像（裁剪或填充后为output_shape大小），
+                              第二个是生成的对应LR图像，其尺寸为(output_shape除以scale)。
+    """
+    if isinstance(image, np.ndarray):
+        img_np = image.copy()
+        if img_np.ndim == 2:
+            # 灰度图扩展为三通道
+            img_np = np.stack([img_np] * 3, axis=2)
+        elif img_np.ndim == 3:
+            img_np = img_np[:, :, ::-1]  # BGR转RGB
+    else:
+        img_np = np.array(image.convert("RGB"), dtype=np.uint8)
+
+    # 获取图像尺寸
+    H, W, C = img_np.shape
+
+    # 2. 数据增强：随机翻转
+    if random.random() < 0.5:
+        img_np = np.flip(img_np, axis=1)  # 水平翻转
+    if random.random() < 0.5:
+        img_np = np.flip(img_np, axis=0)  # 垂直翻转
+    # 随机旋转90度的倍数
+    rot_k = random.choice([0, 1, 2, 3])  # 0不旋转，1=90°, 2=180°, 3=270°
+    if rot_k != 0:
+        img_np = np.rot90(img_np, k=rot_k)
+    # 更新尺寸
+    H, W = img_np.shape[0], img_np.shape[1]
+
+    # 随机裁剪并填充（保持尺寸不变）的数据增强
+    if random.random() < 0.5:
+        random_h = random.random() * 0.3
+        random_w = random.random() * 0.3
+        max_crop_h = max(1, int(random_h * H))
+        max_crop_w = max(1, int(random_w * W))
+        dx = random.randint(-max_crop_w, max_crop_w)  # 水平位移（正值表示向右移动）
+        dy = random.randint(-max_crop_h, max_crop_h)  # 垂直位移（正值表示向下移动）
+        # 计算裁剪区域
+        left_crop = max(-dx, 0)  # 若dx为负，裁剪左侧 |dx| 列
+        right_crop = max(dx, 0)  # 若dx为正，裁剪右侧 dx 列
+        top_crop = max(-dy, 0)  # dy为负，裁剪上方 |dy| 行
+        bottom_crop = max(dy, 0)  # dy为正，裁剪下方 dy 行
+        rem_h = H - top_crop - bottom_crop  # 剩余高度
+        rem_w = W - left_crop - right_crop  # 剩余宽度
+        if rem_h > 0 and rem_w > 0:
+            # 创建新图像并将裁剪后的原图放置到新图像中
+            new_img = np.zeros((H, W, C), dtype=img_np.dtype)
+            new_img[top_crop : top_crop + rem_h, left_crop : left_crop + rem_w] = (
+                img_np[top_crop : top_crop + rem_h, left_crop : left_crop + rem_w]
+            )
+            img_np = new_img
+            # 图像尺寸H, W保持不变
+
+    # 增强后的HR图像作为输出高分辨率图像（不含模糊/噪声等退化）
+    hr_img = img_np.copy()
+
+    # 复制一份用于生成退化的LR图像
+    lr_img = hr_img.copy()
+
+    # 3. 盲退化策略：模糊（高斯模糊或运动模糊）
+    blur_choice = random.random()
+    if blur_choice < 0.33:
+        # 高斯模糊
+        sigma = random.uniform(0.5, 3.0)  # 随机选择模糊程度
+        lr_img = cv2.GaussianBlur(lr_img, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    elif blur_choice < 0.66:
+        # 运动模糊
+        angle = random.choice([0, 45, 90, 135])  # 随机方向
+        k = random.choice([3, 5, 7, 9, 11, 13, 15])  # 随机核长度（取奇数）
+        if angle == 0:
+            # 水平运动模糊
+            kernel = np.zeros((1, k), np.float32)
+            kernel[0, :] = 1.0 / k
+        elif angle == 90:
+            # 垂直运动模糊
+            kernel = np.zeros((k, 1), np.float32)
+            kernel[:, 0] = 1.0 / k
+        elif angle == 45:
+            # 45°对角线运动模糊
+            kernel = np.zeros((k, k), np.float32)
+            np.fill_diagonal(kernel, 1)
+            kernel /= k
+        else:
+            # 135°对角线运动模糊
+            kernel = np.zeros((k, k), np.float32)
+            for i in range(k):
+                kernel[i, k - 1 - i] = 1.0
+            kernel /= k
+        # 注意：OpenCV默认使用BGR，所以先转换
+        lr_img_bgr = cv2.cvtColor(lr_img, cv2.COLOR_RGB2BGR)
+        lr_img_bgr = cv2.filter2D(lr_img_bgr, -1, kernel)
+        lr_img = cv2.cvtColor(lr_img_bgr, cv2.COLOR_BGR2RGB)
+    # 如果 blur_choice >= 0.66，则不进行模糊
+
+    # 盲退化策略：噪声（高斯噪声或泊松噪声）
+    noise_choice = random.random()
+    if noise_choice < 0.33:
+        # 添加高斯噪声
+        lr_float = lr_img.astype(np.float32)
+        sigma_n = random.uniform(1, 10)
+        noise = np.random.normal(0, sigma_n, lr_float.shape)
+        lr_float += noise
+        lr_img = np.clip(lr_float, 0, 255).astype(np.uint8)
+    elif noise_choice < 0.66:
+        # 添加泊松噪声
+        lr_float = lr_img.astype(np.float32)
+        vals = np.random.poisson(lr_float)
+        lr_img = np.clip(vals, 0, 255).astype(np.uint8)
+    # 若 noise_choice >= 0.66，则不加噪声
+
+    # 盲退化策略：颜色偏移与伪影（对RGB三个通道随机缩放）
+    lr_float = lr_img.astype(np.float32)
+    factors = [random.uniform(0.9, 1.1) for _ in range(3)]
+    for c in range(3):
+        lr_float[:, :, c] *= factors[c]
+    lr_img = np.clip(lr_float, 0, 255).astype(np.uint8)
+
+    # 盲退化策略：随机下采样（降分辨率）
+    # 注意：cv2.resize 的参数顺序为 (width, height)
+    new_h = max(1, int(H // scale))
+    new_w = max(1, int(W // scale))
+    interp = random.choice([cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC])
+    lr_img = cv2.resize(lr_img, (new_w, new_h), interpolation=interp)
+
+    # 盲退化策略：JPEG压缩造成的伪影
+    if random.random() < 0.5:
+        quality = random.randint(30, 95)
+        _, enc = cv2.imencode(
+            ".jpg",
+            cv2.cvtColor(lr_img, cv2.COLOR_RGB2BGR),
+            [int(cv2.IMWRITE_JPEG_QUALITY), quality],
+        )
+        lr_img = cv2.imdecode(enc, cv2.IMREAD_COLOR)
+        lr_img = cv2.cvtColor(lr_img, cv2.COLOR_BGR2RGB)
+
+    # -------------------------------
+    # 5. 最终裁剪与填充：保证 HR 图像为 output_shape，且裁剪起点对 scale 取整
+    desired_h, desired_w = output_shape
+    # 如果 HR 图像尺寸不足，则进行填充（使用黑色填充）
+    pad_h = max(0, desired_h - hr_img.shape[0])
+    pad_w = max(0, desired_w - hr_img.shape[1])
+    if pad_h > 0 or pad_w > 0:
+        hr_img = cv2.copyMakeBorder(
+            hr_img, 0, pad_h, 0, pad_w, borderType=cv2.BORDER_CONSTANT, value=0
+        )
+        # 同步对 lr_img 进行填充前的更新：由于 lr_img 已经下采样，
+        # 如果 HR 经过填充后尺寸变化，LR 需要重新计算尺寸（近似用当前插值方式）
+        new_lr_h = hr_img.shape[0] // scale
+        new_lr_w = hr_img.shape[1] // scale
+        lr_img = cv2.resize(lr_img, (new_lr_w, new_lr_h), interpolation=interp)
+
+    H, W, _ = hr_img.shape
+    # 选择随机裁剪位置，确保裁剪区域大小为 output_shape
+    max_top = H - desired_h
+    max_left = W - desired_w
+    top = random.randint(0, max_top)
+    left = random.randint(0, max_left)
+    # 调整裁剪起点为 scale 的倍数
+    top = top - (top % scale)
+    left = left - (left % scale)
+
+    hr_img_cropped = hr_img[top : top + desired_h, left : left + desired_w]
+    # 对应 LR 图像裁剪：由于 lr_img 为 HR 下采样后的图像，
+    # 则裁剪起点为 (top//scale, left//scale)，裁剪尺寸为 (desired_h//scale, desired_w//scale)
+    lr_top = top // scale
+    lr_left = left // scale
+    desired_h_lr = desired_h // scale
+    desired_w_lr = desired_w // scale
+    lr_img_cropped = lr_img[
+        lr_top : lr_top + desired_h_lr, lr_left : lr_left + desired_w_lr
+    ]
+    # -------------------------------
+
+    # 最终返回裁剪后的图像
+    out_hr, out_lr = hr_img_cropped.astype(np.uint8), lr_img_cropped.astype(np.uint8)
+    return out_hr, out_lr
+
+
 class ImageDataset(data.Dataset):
     """
     图像数据集类。
@@ -48,9 +234,14 @@ class ImageDataset(data.Dataset):
         extra_data_paths = self.opt.extra_data
         for extra_data_path in extra_data_paths:
             if os.path.isdir(extra_data_path):
-                self.dynamic_hr_image_paths.extend(
-                    glob.glob(os.path.join(extra_data_path, "*.png"))
-                )
+                image_extensions = ["*.png", "*.bmp", "*.jpg", "*.jpeg"]
+                for ext in image_extensions:
+                    self.dynamic_hr_image_paths.extend(
+                        glob.glob(os.path.join(extra_data_path, ext))
+                    )
+                    print(
+                        f"加载额外数据: {extra_data_path} 中的图像文件: {len(self.dynamic_hr_image_paths)}"
+                    )
             else:
                 print(
                     f"警告: opt.extra_data 路径 '{extra_data_path}' 不是有效目录。将不会加载此路径的额外数据。"
@@ -71,8 +262,8 @@ class ImageDataset(data.Dataset):
         lr_image = None
 
         if hr_image is not None:
-            if image_path in self.dynamic_hr_image_paths:
-                hr_image = self._random_crop(hr_image, 448, 640)
+            # if image_path in self.dynamic_hr_image_paths:
+            hr_image = self._random_crop(hr_image, 448, 640)
 
             # 使用 bicubic 下采样生成 LR 图像
             lr_image = cv2.resize(
@@ -83,23 +274,6 @@ class ImageDataset(data.Dataset):
                 ),
                 interpolation=cv2.INTER_CUBIC,
             )
-            # 示例：模糊+噪声+压缩
-            # noisy = hr_image + np.random.normal(0, 10**0.5, hr_image.shape)
-            # cv2.normalize(noisy, noisy, 0, 255, cv2.NORM_MINMAX, dtype=-1).astype(
-            #     np.uint8
-            # )
-            # noisy = cv2.resize(
-            #     noisy,
-            #     fx=1 / self.upscaling_factor,
-            #     fy=1 / self.upscaling_factor,
-            #     dsize=None,
-            #     interpolation=cv2.INTER_CUBIC,
-            # )
-            # encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 95]
-            # _, encoded_image = cv2.imencode(".jpg", noisy, encode_param)
-            # lr_image = cv2.imdecode(encoded_image, 0)
-            # if lr_image.ndim == 2:
-            #     lr_image = np.stack([lr_image] * 3, axis=-1)
 
         if self.phase == "train" and hr_image is not None:
             lr_image, hr_image = self._augment(lr_image, hr_image)  # 数据增强
@@ -113,44 +287,25 @@ class ImageDataset(data.Dataset):
             return None  # 处理图像加载失败的情况
 
     def __len__(self):
-        """
-        获取数据集长度。
-
-        Returns:
-            int: 数据集长度。
-        """
         return len(self.image_list)
 
     def _load_image(self, path):
-        """
-        加载图像，并根据文件类型进行处理。
-
-        Args:
-            path (str): 图像路径。
-
-        Returns:
-            numpy.ndarray: 加载并处理后的图像，形状为 (H, W, 3)，RGB 格式。
-                        如果加载失败，则返回 None。
-        """
         try:
             if path.lower().endswith(".bmp"):
                 img = cv2.imread(path)
                 if img is None:
                     raise Exception(f"无法读取 BMP 图像: {path}")
-                return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
             elif path.lower().endswith(".png"):
                 img = cv2.imread(path, cv2.IMREAD_UNCHANGED)  # 读取所有通道
                 if img is None:
                     raise Exception(f"无法读取 PNG 图像: {path}")
                 if img.ndim == 2:  # 灰度图
-                    return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
                 elif img.shape[2] == 3:  # RGB 图
-                    # chosen_channel = random.randint(0, 2)
-                    # return np.stack([img[:, :, chosen_channel]] * 3, axis=-1)
-                    return np.stack(
-                        [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)] * 3, axis=-1
-                    )
+                    chosen_channel = random.randint(0, 2)
+                    img = np.stack([img[:, :, chosen_channel]] * 3, axis=-1)
                 else:
                     raise Exception(f"图像通道数异常: {path}, 通道数: {img.shape[2]}")
 
@@ -158,7 +313,9 @@ class ImageDataset(data.Dataset):
                 img = cv2.imread(path)
                 if img is None:
                     raise Exception(f"无法读取图像: {path}")
-                return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+            return img
 
         except Exception as e:
             print(f"加载图像时出错: {path}: {e}")
@@ -197,9 +354,6 @@ class ImageDataset(data.Dataset):
         return img[top : top + min_h, left : left + min_w]
 
     def _augment(self, lr_image, hr_image):
-        """改进后的数据增强方法，包含多种几何变换与色彩抖动"""
-
-        # 随机旋转（-30度到30度）
         if random.random() < 0.5:
             angle = random.uniform(-30, 30)
             h, w = lr_image.shape[:2]
@@ -241,7 +395,6 @@ class ImageDataset(data.Dataset):
                 hr_image, M_hr, (hr_w, hr_h), borderMode=cv2.BORDER_REFLECT_101
             )
 
-        # 色彩抖动（同步调整LR/HR）
         if random.random() < 0.5:
             # 生成随机色彩参数
             brightness = random.uniform(0.8, 1.2)
@@ -256,14 +409,12 @@ class ImageDataset(data.Dataset):
                 hr_image, brightness, contrast, saturation
             )
 
-        # 添加高斯噪声到LR
         if random.random() < 0.3:
             sigma = random.uniform(0, 5)  # 控制噪声强度
             noise = np.random.normal(0, sigma, lr_image.shape).astype(np.float32)
             lr_image = cv2.add(lr_image.astype(np.float32), noise)
             lr_image = np.clip(lr_image, 0, 255).astype(np.uint8)
 
-        # 随机翻转（保持原有逻辑）
         if random.random() > 0.5:
             lr_image = cv2.flip(lr_image, 1)
             hr_image = cv2.flip(hr_image, 1)
@@ -363,6 +514,7 @@ def get_dataloader(opt):
         shuffle=True,
         num_workers=opt.num_workers,
         pin_memory=True,
+        drop_last=True,
     )
     valid_dataloader = torch.utils.data.DataLoader(
         valid_dataset,

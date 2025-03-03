@@ -1,32 +1,30 @@
 # ===== 实验环境配置 =====
 seed: 42  # 随机种子，用于确保实验的可重复性 
-exp_name: "v3_dim192block12gr8dp0.16_resume_v2"  # 实验名称
-# exp_name: "v3_dim192block12gr8dp0.16_df2kost300gray"  # 实验名称
+# exp_name: "v10+lkfb_attn_sigmoid"  # 实验名称
+exp_name: "v3_finetune_attn_mulsubattn_res_df2k_adamw"  # 实验名称
 save_wandb: true  # 是否将训练过程的指标保存到 wandb
 project: "PBVS"  # wandb 项目名称
 
 # ===== 数据集配置 =====
 data_path: "/media/hdd/sonwe1e/Competition/PBVS_Thermal/Data"  # 数据集路径
 num_workers: 8  # 用于数据加载的并行线程数
-extra_data: ''
+extra_data: 
+- '/media/hdd/sonwe1e/Competition/PBVS_Thermal/DF2K'
+# - '/media/hdd/sonwe1e/Competition/PBVS_Thermal/images_thermal_train/data'
 # - '/media/hdd/sonwe1e/Competition/PBVS_Thermal/OST300'
-# - '/media/hdd/sonwe1e/Competition/PBVS_Thermal/DF2K'
 
 # ===== 模型配置 =====
-resume: null  # 模型恢复的 checkpoint 路径
+resume: null
 
 # ===== 模型配置 =====
-model: 'smfanet'
+upscaling_factor: 8
 dim: 192
 n_blocks: 12
 pcfn_growth: 8
-# dim: 96
-# n_blocks: 8
-# pcfn_growth: 4
 upscaling_factor: 8
 smfa_growth: 4
 snfa_dropout: 0.0
-pcfn_dropout: 0.16
+pcfn_dropout: 0.16 
 p_rate: 0.25
 
 # ===== 优化器配置 =====
@@ -36,14 +34,14 @@ weight_decay: 0.0005  # 权重衰减系数，用于防止过拟合
 beta2: 0.999  # Adam 优化器的 beta2 参数
 
 # ===== 训练配置 =====
-batch_size: 8  # 批次大小
-epochs: 800  # 训练的总轮数
-devices: 3  # 使用的 GPU 设备 ID，一般不使用多卡，使用多卡修改为列表 [0, 1]
+batch_size: 5  # 批次大小
+epochs: 150  # 训练的总轮数
+devices: 
+- 1
 precision: "32"  # 训练使用的精度模式，常见选择包括 32，16，bf16-mixed
-gradient_clip_val: 4.0  # 梯度裁剪的最大值，用于防止梯度爆炸，默认不使用
+gradient_clip_val: 0  # 梯度裁剪的最大值，用于防止梯度爆炸，默认不使用
 accumulate_grad_batches: 1  # 梯度累积的 batch 数，用于模拟更大的 batch size，默认不使用
 
 # ===== 监控配置 =====
 val_check: 1.0  # 验证集频率，当容易出现过拟合现象的时候可以设置较小的值找到比较好的 checkpoint
 log_step: 50  # 日志记录的频率，例如每训练 log_step 个 batch 记录一次
-

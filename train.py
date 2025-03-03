@@ -17,9 +17,10 @@ if __name__ == "__main__":
     from tools.models.pnet import PNet
     from tools.models.scnet import SCNet
     from tools.models.lkfn import LKFN
-    from tools.models.fusion import FusionNet, FusionNetv2
+    from tools.models.mynet import FusionNet, Ensemble
+    from tools.models.competition_backup import FusionNet
 
-    model = FusionNetv2(
+    model = FusionNet(
         dim=opt.dim,
         n_blocks=opt.n_blocks,
         upscaling_factor=opt.upscaling_factor,
@@ -31,6 +32,7 @@ if __name__ == "__main__":
             "p_rate": opt.p_rate,
         },
     )
+    # model = Ensemble()
     # model = LKFN()
     # model = PNet()
     # model = SCNet()
@@ -49,8 +51,7 @@ if __name__ == "__main__":
 
     trainer = pl.Trainer(
         accelerator="auto",
-        # devices=[4, 5],
-        devices=[opt.devices],
+        devices=opt.devices,
         strategy="auto",
         max_epochs=opt.epochs,
         precision=opt.precision,
@@ -65,8 +66,8 @@ if __name__ == "__main__":
                 dirpath=os.path.join("./checkpoints", opt.exp_name),
                 monitor="metric/valid_psnr",
                 mode="max",
-                save_top_k=5,
-                save_last=False,
+                save_top_k=10,
+                save_last=True,
                 filename="epoch_{epoch}-loss_{metric/valid_psnr:.3f}",
                 auto_insert_metric_name=False,
             )

@@ -3,102 +3,208 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import LayerNorm2d
 from timm.models.layers import DropPath, Mlp
+from typing import Optional
+from tools.models.scnet import SCNet
+
+
+class MultiQueryAttentionV2(nn.Module):
+    """Multi Query Attention.
+
+    Fast Transformer Decoding: One Write-Head is All You Need
+    https://arxiv.org/pdf/1911.02150.pdf
+
+    This is an acceletor optimized version - removing multiple unnecessary
+    tensor transpose by re-arranging indices according to the following rules: 1)
+    contracted indices are at the end, 2) other indices have the same order in the
+    input and output tensores.
+
+    Compared to V1, this gives 3x speed up.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        dim_out: Optional[int] = None,
+        num_heads: int = 8,
+        key_dim: int = 64,
+        value_dim: int = 64,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ):
+        """Initializer."""
+        super().__init__()
+        dim_out = dim_out or dim
+        self.num_heads = num_heads
+        self.key_dim = key_dim
+        self.value_dim = value_dim
+        self.scale = key_dim**-0.5
+
+        self.query_proj = nn.Parameter(torch.randn([self.num_heads, self.key_dim, dim]))
+        self.key_proj = nn.Parameter(torch.randn([dim, self.key_dim]))
+        self.value_proj = nn.Parameter(torch.randn([dim, self.value_dim]))
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.out_proj = nn.Parameter(
+            torch.randn([dim_out, self.num_heads, self.value_dim])
+        )
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def _reshape_input(self, t):
+        """Reshapes a tensor to three dimensions, keeping the first and last."""
+        s = t.shape
+        # Propagate the shape statically where possible.
+        # num = t.shape[1:-1].numel()
+        # return t.reshape(s[0], num, s[-1])
+        return t.reshape(s[0], s[1], -1).transpose(1, 2)
+
+    def forward(self, x, m: Optional[torch.Tensor] = None):
+        """Run layer computation."""
+        b, _, h, w = x.shape
+        m = m if m is not None else x
+
+        reshaped_x = self._reshape_input(x)
+        reshaped_m = self._reshape_input(m)
+
+        q = torch.einsum("bnd,hkd->bnhk", reshaped_x, self.query_proj)
+        k = torch.einsum("bmd,dk->bmk", reshaped_m, self.key_proj)
+
+        attn = torch.einsum("bnhk,bmk->bnhm", q, k) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        v = torch.einsum("bmd,dv->bmv", reshaped_m, self.value_proj)
+        o = torch.einsum("bnhm,bmv->bnhv", attn, v)
+        result = torch.einsum("bnhv,dhv->bdn", o, self.out_proj)
+        result = self.proj_drop(result)
+        return result.reshape(b, -1, h, w)
+
+
+class FourModule(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        # 检查 in_channels 是否能被4整除
+        assert in_channels % 4 == 0, "in_channels 必须能被4整除"
+        self.c1 = in_channels * 3 // 4  # fea1 的通道数 (3/4)
+        self.c2 = in_channels - self.c1  # fea2 的通道数 (1/4)
+
+        self.conv_expand = nn.Conv2d(self.c1, 4 * self.c1, kernel_size=1, bias=False)
+
+        # 分成4份后的分支，各自输入和输出的通道数均为 self.c1
+        self.branch1 = nn.Conv2d(self.c1, self.c1, kernel_size=1, bias=True)
+        self.branch2 = nn.Conv2d(self.c1, self.c1, kernel_size=3, padding=1, bias=True)
+        # 3x3 空洞卷积：为了保持“same”效果，padding = dilation = 2
+        self.branch3 = nn.Conv2d(
+            self.c1, self.c1, kernel_size=3, padding=2, dilation=2, bias=True
+        )
+        self.branch4 = nn.Conv2d(self.c1, self.c1, kernel_size=7, padding=3, bias=True)
+
+        # 1x1 卷积：将4个分支拼接后的通道数（4*self.c1）降回 self.c1
+        self.conv_reduce = nn.Conv2d(4 * self.c1, self.c1, kernel_size=1, bias=True)
+
+    def forward(self, x):
+        # x: [B, in_channels, H, W]
+        # 将 x 分为 fea1 和 fea2
+        fea1 = x[:, : self.c1, :, :]  # 前3/4通道
+        fea2 = x[:, self.c1 :, :, :]  # 后1/4通道
+
+        # 对 fea1 进行通道扩展：1x1卷积扩展至4倍通道数
+        expanded = self.conv_expand(fea1)  # [B, 4*self.c1, H, W]
+
+        # 将扩展后的特征均分为4份
+        splits = torch.chunk(expanded, 4, dim=1)  # 每个元素形状为 [B, self.c1, H, W]
+
+        out1 = self.branch1(splits[0])
+        out2 = self.branch2(splits[1])
+        out3 = self.branch3(splits[2])
+        out4 = self.branch4(splits[3])
+
+        # 拼接4个分支的输出，得到 [B, 4*self.c1, H, W]
+        concatenated = torch.cat([out1, out2, out3, out4], dim=1)
+
+        # 通过 1x1 卷积降维回 fea1 原来的通道数
+        reduced = self.conv_reduce(concatenated)  # [B, self.c1, H, W]
+
+        # 最后将处理后的 fea1 与原始的 fea2 拼接，恢复到 in_channels
+        out = torch.cat([reduced, fea2], dim=1)  # [B, in_channels, H, W]
+        return out
 
 
 class LinearAttention(nn.Module):
-    def __init__(self, dim, heads=8, dim_head=32):
+    def __init__(self, dim, heads=4, dim_head=64):
         super().__init__()
         self.heads = heads
         self.dim_head = dim_head
         inner_dim = heads * dim_head
 
-        # 线性变换生成Q、K、V
         self.to_qkv = nn.Conv2d(dim, inner_dim * 3, kernel_size=1, bias=False)
-        # 输出变换
         self.to_out = nn.Conv2d(inner_dim, dim, kernel_size=1)
 
     def forward(self, x):
         b, c, h, w = x.shape
+        qkv = self.to_qkv(x).chunk(3, dim=1)
+        q, k, v = map(lambda t: t.view(b, self.heads, self.dim_head, h * w), qkv)
 
-        # 生成Q、K、V [b, 3*inner_dim, h, w]
-        qkv = self.to_qkv(x)
-        q, k, v = torch.split(qkv, self.heads * self.dim_head, dim=1)
+        q = q.softmax(dim=-2)  # 特征维度归一化
+        k = k.softmax(dim=-1)  # 空间维度归一化
 
-        # 拆分为多头 [b, heads, dim_head, h*w]
-        q = q.view(b, self.heads, self.dim_head, h * w)
-        k = k.view(b, self.heads, self.dim_head, h * w)
-        v = v.view(b, self.heads, self.dim_head, h * w)
-
-        # 线性注意力核心计算
-        q = q.softmax(dim=-2)  # 在特征维度做softmax
-        k = k.softmax(dim=-1)  # 在空间维度做softmax
-
-        # 计算上下文向量 [b, heads, dim_head, dim_head]
         context = torch.einsum("bhdn,bhen->bhde", k, v)
-
-        # 聚合上下文 [b, heads, dim_head, h*w]
         out = torch.einsum("bhde,bhdn->bhen", context, q)
-
-        # 合并多头 [b, heads*dim_head, h, w]
-        out = out.view(b, self.heads * self.dim_head, h, w)
-
-        # 输出变换
+        out = out.view(b, -1, h, w)
         return self.to_out(out)
 
 
-class TransformerLayer(nn.Module):
-    def __init__(self, dim, num_heads=8, mlp_ratio=2.0, drop=0.0):
+class OriginAttention(nn.Module):
+    def __init__(self, dim, heads=4, dim_head=64):
         super().__init__()
-        self.norm1 = LayerNorm2d(dim)
-        self.attn = LinearAttention(dim, heads=num_heads)
-        self.drop_path = DropPath(drop) if drop > 0.0 else nn.Identity()
-        self.norm2 = LayerNorm2d(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(
-            in_features=dim,
-            hidden_features=mlp_hidden_dim,
-            act_layer=nn.GELU,
-            drop=drop,
-            use_conv=True,
+        inner_dim = dim_head * heads
+        self.dim_head = dim_head
+        self.heads = heads
+        self.scale = dim_head**-0.5
+
+        # 定义卷积层，用于生成 q, k, v
+        self.to_qkv = nn.Conv2d(dim, inner_dim * 3, 1, bias=False)
+        # 定义输出卷积层
+        self.to_out = nn.Conv2d(inner_dim, dim, 1)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        # 获取 q, k, v，通过卷积生成
+        qkv = self.to_qkv(x).reshape(b, 3, self.heads, self.dim_head, h, w)
+        q, k, v = qkv.unbind(dim=1)
+
+        # 对 q, k, v 进行调整，将 h, w 维度展平
+        q = q.view(b, self.heads, self.dim_head, -1).transpose(2, 3)
+        k = k.view(b, self.heads, self.dim_head, -1).transpose(2, 3)
+        v = v.view(b, self.heads, self.dim_head, -1).transpose(2, 3)
+        # 计算注意力矩阵
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # [b, heads, h*w, h*w]
+        # attn = attn.softmax(dim=-1)  # 注意力归一化
+        attn = F.sigmoid(attn)  # 注意力归一化
+
+        # 加权求和得到输出
+        out = attn @ v  # [b, heads, h*w, dim_head]
+        out = out.transpose(1, 2).reshape(b, self.heads * self.dim_head, h, w)
+
+        # 通过 to_out 卷积层进行最终映射
+        x = self.to_out(out)
+        return x
+
+
+class AttentionFFN(nn.Module):
+    def __init__(self, dim, heads=4, dim_head=64, downsample=4):
+        super().__init__()
+        self.downsample = nn.AvgPool2d(downsample)
+        self.attention = OriginAttention(dim, heads, dim_head)
+        self.upsample = nn.Sequential(
+            nn.Upsample(scale_factor=downsample, mode="bilinear", align_corners=False),
+            nn.Conv2d(dim, dim, 3, padding=1),  # 上采样后卷积增强细节
         )
+        self.ffn = Mlp(dim, int(dim * 4), use_conv=True)
+        self.ln1 = LayerNorm2d(dim)
+        self.ln2 = LayerNorm2d(dim)
 
     def forward(self, x):
-        identity = x
-        x = self.norm1(x)
-        x = self.drop_path(self.attn(x)) + identity
-        identity = x
-        x = self.norm2(x)
-        x = self.drop_path(self.mlp(x)) + identity
-        return x
-
-
-class STLConv(nn.Module):
-    def __init__(self, dim, out_dim, kernel_size=3, stride=1, padding=1):
-        super(STLConv, self).__init__()
-        self.stl = TransformerLayer(dim)
-        self.conv = nn.Conv2d(dim, out_dim, kernel_size, stride=stride, padding=padding)
-        self.leaky_relu = nn.LeakyReLU(inplace=True)
-
-    def forward(self, x):
-        x = self.stl(x)
-        x = self.conv(x)
-        x = self.leaky_relu(x)
-        return x
-
-
-class ResidualDenseGroup(nn.Module):
-    def __init__(self, dim):
-        super(ResidualDenseGroup, self).__init__()
-        self.l1 = STLConv(dim, dim // 2, kernel_size=3, stride=1, padding=1)
-        self.l2 = STLConv(dim * 3 // 2, dim // 2, kernel_size=3, stride=1, padding=1)
-        self.l3 = STLConv(dim * 2, dim, kernel_size=3, stride=1, padding=1)
-        self.fusion = STLConv(dim, dim, kernel_size=3, stride=1, padding=1)
-
-    def forward(self, x):
-        x1 = self.l1(x)  # c // 4
-        x2 = self.l2(torch.cat([x, x1], dim=1))  # 5c // 4
-        x3 = self.l3(torch.cat([x, x1, x2], dim=1))  # 3c // 2
-        x = self.fusion(x3)  # c
+        x = self.ln1(self.upsample(self.attention(self.downsample(x)))) + x
+        x = self.ln2(self.ffn(x)) + x
         return x
 
 
@@ -251,7 +357,6 @@ class LKFB(nn.Module):
         self.c5 = nn.Conv2d(self.dc * 4, self.atten_channels, 1, 1, 0)
         self.atten = Attention(self.atten_channels)
         self.c6 = nn.Conv2d(self.atten_channels, out_channels, 1, 1, 0)
-        # self.pixel_norm = nn.LayerNorm(out_channels)
 
     def forward(self, input):
         distilled_c1 = self.act(self.c1_d(input))
@@ -273,11 +378,6 @@ class LKFB(nn.Module):
 
         out = self.atten(out)
         out = self.c6(out)
-
-        # out = out.permute(0, 2, 3, 1)
-        # out = self.pixel_norm(out)
-        # out = out.permute(0, 3, 1, 2).contiguous()
-
         return out
 
 
@@ -517,6 +617,8 @@ class Fusion(nn.Module):
         self.smfa = SMFA(dim, smfa_growth, snfa_dropout)
         self.pcfn = PCFN(dim, pcfn_growth, p_rate, pcfn_dropout)  # 部分连接前馈网络
         self.lkfb = LKFB(dim, dim, conv=PartialBSConvU)  # 局部关键特征融合
+        self.main_attn = AttentionFFN(dim)  # 动态多层感知机
+        self.sub_attn = AttentionFFN(dim)  # 动态多层感知机
         self.ln1 = LayerNorm2d(dim)  # Layer Normalization
         self.ln2 = LayerNorm2d(dim)  # Layer Normalization
         self.ln3 = LayerNorm2d(dim)  # Layer Normalization
@@ -531,9 +633,12 @@ class Fusion(nn.Module):
         Returns:
             torch.Tensor: 输出特征图。
         """
+        out = self.sub_attn(x)
         x = self.ln1(self.smfa(x)) + x
         x = self.ln2(self.pcfn(x)) + x
         x = self.ln3(self.lkfb(x)) + x
+        # x = self.main_attn(x) + out
+        x = self.main_attn(x) * F.sigmoid(out)
         return x
 
 
@@ -595,8 +700,9 @@ class FusionNet(nn.Module):
             torch.Tensor: 超分辨率图像。
         """
         x = self.to_feat(x)
-        x = self.feats(x)
+        x = self.feats(x) + x
         x = self.to_img(x)
+
         return x
 
 

@@ -8,6 +8,7 @@
 @Time    :   2023/2/1 20:08
 @Desc    :
 """
+
 import torch
 
 import torch.nn as nn
@@ -70,7 +71,6 @@ class ConvBNReLU2D(torch.nn.Module):
             self.act = torch.nn.Softmax2d()
 
     def forward(self, inputs):
-
         out = self.layers(inputs)
 
         if self.norm is not None:
@@ -134,8 +134,9 @@ class AvgPool2d(nn.Module):
                 r2 = min(self.max_r2, r2)
                 s = x[:, :, ::r1, ::r2].cumsum(dim=-1).cumsum(dim=-2)
                 n, c, h, w = s.shape
-                k1, k2 = min(h - 1, self.kernel_size[0] // r1), min(
-                    w - 1, self.kernel_size[1] // r2
+                k1, k2 = (
+                    min(h - 1, self.kernel_size[0] // r1),
+                    min(w - 1, self.kernel_size[1] // r2),
                 )
                 out = (
                     s[:, :, :-k1, :-k2]
@@ -191,7 +192,6 @@ class Local_Base:
 
 
 class LayerNormFunction(torch.autograd.Function):
-
     @staticmethod
     def forward(ctx, x, weight, bias, eps):
         ctx.eps = eps
@@ -223,7 +223,6 @@ class LayerNormFunction(torch.autograd.Function):
 
 
 class LayerNorm2d(nn.Module):
-
     def __init__(self, channels, eps=1e-6):
         super(LayerNorm2d, self).__init__()
         self.register_parameter("weight", nn.Parameter(torch.ones(channels)))
@@ -241,7 +240,7 @@ class SimpleGate(nn.Module):
 
 
 class NAFBlock(nn.Module):
-    def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0.0):
+    def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0.05):
         super().__init__()
         dw_channel = c * DW_Expand
         self.conv1 = nn.Conv2d(
@@ -347,7 +346,6 @@ class NAFBlock(nn.Module):
 
 
 class NAFNet(nn.Module):
-
     def __init__(
         self,
         img_channel=3,
@@ -405,7 +403,6 @@ class NAFNet(nn.Module):
         self.padder_size = 2 ** len(self.encoders)
 
     def forward(self, inp):
-
         B, C, H, W = inp.shape
         inp = self.check_image_size(inp)
 
@@ -446,7 +443,7 @@ class NAFNetLocal(Local_Base, NAFNet):
         train_size=(1, 4, 256, 256),
         base_size=(640, 640),
         fast_imp=False,
-        **kwargs
+        **kwargs,
     ):
         Local_Base.__init__(self)
         NAFNet.__init__(self, *args, **kwargs)

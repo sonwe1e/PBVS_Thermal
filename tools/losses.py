@@ -227,6 +227,20 @@ class GradientHistLoss(nn.Module):
         return loss / len(pred_grad)
 
 
+class CharbonnierLoss(nn.Module):
+    def __init__(self, epsilon=1e-3):
+        super(CharbonnierLoss, self).__init__()
+        self.epsilon = epsilon
+
+    def forward(self, x, y):
+        """
+        x: 预测值
+        y: 真实值
+        """
+        loss = torch.sqrt((x - y) ** 2 + self.epsilon**2)
+        return torch.mean(loss)
+
+
 # 示例用法 (假设你的图像已经在 [0, 1] 范围内):
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
