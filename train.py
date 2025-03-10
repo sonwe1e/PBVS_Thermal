@@ -1,11 +1,13 @@
 import torch
 from configs.option import get_option
-from tools.datasets.datasets import *
+from tools.datasets.datasetsv2 import *
 from tools.pl_tool import *
 import lightning.pytorch as pl
 from lightning.pytorch.loggers import WandbLogger
 import wandb
 import os
+import time
+
 
 torch.set_float32_matmul_precision("high")
 
@@ -17,25 +19,30 @@ if __name__ == "__main__":
     from tools.models.pnet import PNet
     from tools.models.scnet import SCNet
     from tools.models.lkfn import LKFN
-    from tools.models.mynet import FusionNet, Ensemble
     from tools.models.competition_backup import FusionNet
+    from tools.models.mynet import FusionNet
 
-    model = FusionNet(
-        dim=opt.dim,
-        n_blocks=opt.n_blocks,
-        upscaling_factor=opt.upscaling_factor,
-        fmb_params={
-            "smfa_growth": opt.smfa_growth,
-            "pcfn_growth": opt.pcfn_growth,
-            "snfa_dropout": opt.snfa_dropout,
-            "pcfn_dropout": opt.pcfn_dropout,
-            "p_rate": opt.p_rate,
-        },
-    )
+    # model = FusionNet(
+    #     dim=opt.dim,
+    #     n_blocks=opt.n_blocks,
+    #     upscaling_factor=opt.upscaling_factor,
+    #     fmb_params={
+    #         "smfa_growth": opt.smfa_growth,
+    #         "pcfn_growth": opt.pcfn_growth,
+    #         "snfa_dropout": opt.snfa_dropout,
+    #         "pcfn_dropout": opt.pcfn_dropout,
+    #         "p_rate": opt.p_rate,
+    #     },
+    # )
     # model = Ensemble()
     # model = LKFN()
     # model = PNet()
     # model = SCNet()
+    model = FusionNet(
+        dim=opt.dim,
+        n_blocks=opt.n_blocks,
+        upscaling_factor=opt.upscaling_factor,
+    )
     """模型编译"""
     # model = torch.compile(model)
     """导入数据集"""
@@ -66,7 +73,7 @@ if __name__ == "__main__":
                 dirpath=os.path.join("./checkpoints", opt.exp_name),
                 monitor="metric/valid_psnr",
                 mode="max",
-                save_top_k=10,
+                save_top_k=3,
                 save_last=True,
                 filename="epoch_{epoch}-loss_{metric/valid_psnr:.3f}",
                 auto_insert_metric_name=False,

@@ -19,18 +19,21 @@ class LightningModule(pl.LightningModule):
         self.l1_loss = torch.nn.L1Loss()  # 交叉熵损失函数
         self.fft_loss = FFTLoss()
         self.ssim_loss = SSIMLoss()
-        ckpt = torch.load(
-            "/media/hdd/sonwe1e/Competition/PBVS_Thermal/checkpoints/epoch_497-loss_26.740.ckpt",
-            weights_only=False,
-            map_location="cpu",
-        )["state_dict"]
-        for k in list(ckpt.keys()):
-            if "loss" in k:
-                ckpt.pop(k)
-            if "model." in k:
-                ckpt[k.replace("model.", "")] = ckpt.pop(k)
-        ckpt.pop("to_img.0.weight")
-        self.model.load_state_dict(ckpt, strict=False)
+        # ckpt = torch.load(
+        #     "/media/hdd/sonwe1e/Competition/ImageSuperResolution/checkpoints/epoch_497-loss_26.740.ckpt",
+        #     weights_only=False,
+        #     map_location="cpu",
+        # )["state_dict"]
+        # for k in list(ckpt.keys()):
+        #     if not k.startswith("model."):
+        #         new_k = "model." + k
+        #         ckpt[new_k] = ckpt[k]
+        #         del ckpt[k]
+        #         continue
+        #     if k not in self.state_dict():
+        #         del ckpt[k]
+        # self.model.load_state_dict(ckpt, strict=False)
+        # del ckpt
 
     def forward(self, x):
         """前向传播"""
@@ -39,18 +42,12 @@ class LightningModule(pl.LightningModule):
 
     def configure_optimizers(self):
         """配置优化器和学习率 Scheduler"""
-        # self.optimizer = heavyball.ForeachAdamW(
-        #     self.parameters(),
-        #     weight_decay=self.opt.weight_decay,
-        #     lr=self.learning_rate,
-        #     betas=(0.9, self.opt.beta2),
-        #     caution=True,
-        # )
-        self.optimizer = torch.optim.AdamW(
+        self.optimizer = heavyball.ForeachAdamW(
             self.parameters(),
             weight_decay=self.opt.weight_decay,
             lr=self.learning_rate,
             betas=(0.9, self.opt.beta2),
+            caution=True,
         )
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
@@ -69,11 +66,28 @@ class LightningModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         """训练步骤"""
         lr_image, hr_image = (batch["lr_image"], batch["hr_image"])
-        if torch.rand(1) < 0.5:
-            lam = torch.rand(1, device=lr_image.device)
-            index = torch.randperm(lr_image.size(0), device=lr_image.device)
-            lr_image = lam * lr_image + (1 - lam) * lr_image[index, :]
-            hr_image = lam * hr_image + (1 - lam) * hr_image[index, :]
+        # if torch.rand(1) < 0.5:
+        #     lam = torch.rand(1, device=lr_image.device)
+        #     index = torch.randperm(lr_image.size(0), device=lr_image.device)
+        #     lr_image = lam * lr_image + (1 - lam) * lr_image[index, :]
+        #     hr_image = lam * hr_image + (1 - lam) * hr_image[index, :]
+        # Data augmentation with rotation and flipping
+        if self.training and torch.rand(1) < 0.5:
+            # Random rotation (0, 90, 180, or 270 degrees)
+            k = torch.randint(0, 4, (1,)).item()
+            if k > 0:
+                lr_image = torch.rot90(lr_image, k, dims=[2, 3])
+                hr_image = torch.rot90(hr_image, k, dims=[2, 3])
+
+            # Random horizontal flip
+            if torch.rand(1) < 0.5:
+                lr_image = torch.flip(lr_image, dims=[3])
+                hr_image = torch.flip(hr_image, dims=[3])
+
+            # Random vertical flip
+            if torch.rand(1) < 0.5:
+                lr_image = torch.flip(lr_image, dims=[2])
+                hr_image = torch.flip(hr_image, dims=[2])
 
         prediction = self(lr_image)  # 前向传播
         l1_loss = self.l1_loss(prediction, hr_image)  # 交叉熵损失
@@ -124,20 +138,6 @@ class LightningModule(pl.LightningModule):
         ssim = tmi.structural_similarity_index_measure(
             prediction, hr_image, data_range=1
         )
-        if mode == "valid":
-            prediction, hr_image = (prediction * 2) - 1, (hr_image * 2) - 1
-            alex = tmi.learned_perceptual_image_patch_similarity(
-                prediction, hr_image, "alex"
-            )
-            vgg = tmi.learned_perceptual_image_patch_similarity(
-                prediction, hr_image, "vgg"
-            )
-            squeeze = tmi.learned_perceptual_image_patch_similarity(
-                prediction, hr_image, "squeeze"
-            )
-            self.log(f"metric/{mode}_alex", alex, on_step=False, on_epoch=True)
-            self.log(f"metric/{mode}_vgg", vgg, on_step=False, on_epoch=True)
-            self.log(f"metric/{mode}_squeeze", squeeze, on_step=False, on_epoch=True)
 
         self.log(f"metric/{mode}_psnr", psnr, on_step=False, on_epoch=True)
         self.log(f"metric/{mode}_ssim", ssim, on_step=False, on_epoch=True)

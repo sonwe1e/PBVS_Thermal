@@ -4,18 +4,13 @@ from typing import Union, Tuple, Dict, Any, Optional
 from torch.utils.data import DataLoader
 import numpy as np
 from configs.option import get_option
-from tools.datasets.datasets import *
+from tools.datasets.datasetsv2 import *
 
 torch.set_float32_matmul_precision("high")
 
 
 class ImageVisualizer:
-    def __init__(
-        self,
-        opt: Optional[Any] = None,
-        mean: list = [0.485, 0.456, 0.406],
-        std: list = [0.229, 0.224, 0.225],
-    ):
+    def __init__(self, opt: Optional[Any] = None):
         """
         图像可视化工具类（适用于超分任务）
 
@@ -24,8 +19,6 @@ class ImageVisualizer:
             std: 图像归一化标准差
         """
         self.opt = opt
-        self.mean = torch.tensor(mean).reshape(3, 1, 1)
-        self.std = torch.tensor(std).reshape(3, 1, 1)
 
     def denormalize(self, image: torch.Tensor) -> torch.Tensor:
         """
@@ -37,7 +30,7 @@ class ImageVisualizer:
         Returns:
             反归一化后的图像张量
         """
-        return image + 0.2
+        return image * 0.5 + 0.5
         # return image * self.std + self.mean
 
     def plot_sr_grid(
@@ -119,7 +112,7 @@ def visualize_sr_datasets(
     opt: Any,
     train_dataloader: DataLoader,
     valid_dataloader: DataLoader,
-    num_pairs: int = 8,
+    num_pairs: int = 16,
 ) -> None:
     """
     超分数据集可视化
@@ -163,9 +156,9 @@ def visualize_sr_datasets(
     visualizer.plot_sr_grid(
         images=combined_images,
         titles=titles,
-        nrow=10,  # 每行显示一对（LR和HR）
+        nrow=10,
         title="Super Resolution Data Comparison",
-        save_path="./visualization/SR_comparison.png",
+        save_path="./SR_comparison.png",
     )
 
 

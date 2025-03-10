@@ -10,3 +10,5 @@
 **/*.jpg
 /ExtraData
 **/*.pyc
+**/*.zip
+**/__pycache__/*

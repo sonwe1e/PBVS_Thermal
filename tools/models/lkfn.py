@@ -221,7 +221,7 @@ class LKFN(nn.Module):
         num_feat=28,
         num_atten=28,
         num_block=8,
-        upscale=8,
+        upscale=4,
         num_in=4,
         conv="PartialBSConvU",
         upsampler="pixelshuffledirect",

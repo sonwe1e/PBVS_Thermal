@@ -215,7 +215,7 @@ class ImageDataset(data.Dataset):
 
         # 数据路径
         self.data_path = opt.data_path
-        self.hr_path = os.path.join(self.data_path, phase, "GT")
+        self.hr_path = os.path.join(self.data_path, phase)
 
         # 高分辨率图像路径列表
         self.hr_image_paths = [
@@ -263,7 +263,7 @@ class ImageDataset(data.Dataset):
 
         if hr_image is not None:
             # if image_path in self.dynamic_hr_image_paths:
-            hr_image = self._random_crop(hr_image, 448, 640)
+            hr_image = self._random_crop(hr_image, 448, 512)
 
             # 使用 bicubic 下采样生成 LR 图像
             lr_image = cv2.resize(
@@ -290,36 +290,9 @@ class ImageDataset(data.Dataset):
         return len(self.image_list)
 
     def _load_image(self, path):
-        try:
-            if path.lower().endswith(".bmp"):
-                img = cv2.imread(path)
-                if img is None:
-                    raise Exception(f"无法读取 BMP 图像: {path}")
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-            elif path.lower().endswith(".png"):
-                img = cv2.imread(path, cv2.IMREAD_UNCHANGED)  # 读取所有通道
-                if img is None:
-                    raise Exception(f"无法读取 PNG 图像: {path}")
-                if img.ndim == 2:  # 灰度图
-                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-                elif img.shape[2] == 3:  # RGB 图
-                    chosen_channel = random.randint(0, 2)
-                    img = np.stack([img[:, :, chosen_channel]] * 3, axis=-1)
-                else:
-                    raise Exception(f"图像通道数异常: {path}, 通道数: {img.shape[2]}")
-
-            else:  # 尝试作为普通 BGR 图像读取
-                img = cv2.imread(path)
-                if img is None:
-                    raise Exception(f"无法读取图像: {path}")
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-            return img
-
-        except Exception as e:
-            print(f"加载图像时出错: {path}: {e}")
-            return None  # 返回 None 表示加载失败
+        img = cv2.imread(path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return img
 
     def _random_crop(self, img, min_h, min_w):
         """随机裁剪图像，处理图像尺寸小于目标尺寸的情况"""

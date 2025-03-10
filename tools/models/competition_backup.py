@@ -4,7 +4,235 @@ import torch.nn.functional as F
 from timm.models.layers import LayerNorm2d
 from timm.models.layers import DropPath, Mlp
 from typing import Optional
-from tools.models.scnet import SCNet
+
+
+def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
+    """
+    将输入张量划分为窗口。
+    参数:
+        x (Tensor): 输入特征图，形状为 (B, H, W, C)。
+        window_size (int): 窗口的高度和宽度（假定H和W能被window_size整除）。
+    返回:
+        Tensor: 窗口张量，形状为 (B*num_windows, window_size, window_size, C)。
+    """
+    B, H, W, C = x.shape  # 获取批大小、高度、宽度、通道数
+    # 将每个图像划分成窗口，view的含义如下:
+    # (B, H//window_size, window_size, W//window_size, window_size, C)
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    # 调整维度顺序，将 window_size 维度移到相邻位置，以便之后展平
+    # 维度含义调整为: (B, num_windows_H, num_windows_W, window_size, window_size, C)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+    # 合并批次维度和窗口数维度，将每个窗口作为一个独立样本
+    windows = x.view(-1, window_size, window_size, C)
+    return windows
+
+
+class WindowAttention(nn.Module):
+    r"""窗口多头自注意力模块（Window-based Multi-Head Self-Attention）。
+    支持普通窗口和移位窗口机制。
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        window_size: int,
+        num_heads: int,
+        qkv_bias=True,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+    ):
+        """
+        参数:
+            dim (int): 输入通道数（嵌入维度）。
+            window_size (int): 窗口大小（假定窗口为正方形，实际可传入tuple）。
+            num_heads (int): 注意力头数。
+            qkv_bias (bool): 若为True，为q,k,v映射添加可学习的偏置。默认True。
+            qk_scale (float): 若提供，则用于缩放q*k^T的比例因子；否则使用默认 head_dim^-0.5。
+            attn_drop (float): 注意力矩阵上的Dropout比率。默认0.0。
+            proj_drop (float): 输出上的Dropout比率。默认0.0。
+        """
+        super(WindowAttention, self).__init__()
+        self.dim = dim
+        self.window_size = (window_size, window_size)  # 窗口的高和宽 (Wh, Ww)
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        # 如果未指定qk_scale，则使用默认缩放因子 1/sqrt(head_dim)
+        self.scale = qk_scale or head_dim**-0.5
+
+        # 相对位置偏差表：大小为 (2*Wh-1)*(2*Ww-1) x num_heads
+        # 这是每对位置之间的相对偏差，一共Wh*Ww个token，相对位置索引范围在[-(Wh-1), Wh-1]和[-(Ww-1), Ww-1]之间
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads)
+        )
+
+        # 计算每个窗口内的相对位置索引，用于在forward中查表获取偏差值
+        Wh, Ww = self.window_size
+        coords_h = torch.arange(Wh)
+        coords_w = torch.arange(Ww)
+        coords = torch.stack(
+            torch.meshgrid([coords_h, coords_w], indexing="ij")
+        )  # 形状: (2, Wh, Ww)
+        coords_flatten = torch.flatten(coords, 1)  # 形状: (2, Wh*Ww)
+        # 相对坐标差值 (2, Wh*Ww, Wh*Ww)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        relative_coords = relative_coords.permute(
+            1, 2, 0
+        ).contiguous()  # 转置为 (Wh*Ww, Wh*Ww, 2)
+        # 将坐标起点移到(0,0)
+        relative_coords[..., 0] += Wh - 1  # 横向偏移加上 Wh-1
+        relative_coords[..., 1] += Ww - 1  # 纵向偏移加上 Ww-1
+        relative_coords[..., 0] *= 2 * Ww - 1  # 合并两个坐标，将它们映射到一维索引
+        relative_position_index = relative_coords[..., 0] + relative_coords[..., 1]
+        self.register_buffer("relative_position_index", relative_position_index.long())
+
+        # 定义q, k, v的线性映射，以及注意力和输出的Dropout和最终投影
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.softmax = nn.Softmax(dim=-1)
+
+        # 初始化相对位置偏差表的参数（使用截断正态分布）
+        nn.init.trunc_normal_(
+            self.relative_position_bias_table, std=0.02
+        )  # 若无该函数可改用normal_初始化
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        计算窗口内的多头自注意力。
+        参数:
+            x (Tensor): 窗口展平后的输入，形状为 (num_windows*B, N, C)，其中N=window_size*window_size。
+            mask (Tensor): 掩码张量，形状 (num_windows, N, N)，在使用移位窗口时用于掩盖无效的注意力连接。没有移位时可为None。
+        返回:
+            Tensor: 经过窗口自注意力计算的张量，形状与输入 x 相同。
+        """
+
+        B_, _, __, C = (
+            x.shape
+        )  # B_ 是窗口数乘批大小, N 是每个窗口内元素数 (window_size*window_size), C是通道数
+        N = self.window_size[0] * self.window_size[1]
+        x = x.view(B_, N, C)  # 将每个窗口内的元素展平，形状: [B_, N, C]
+        # 1. 计算 q, k, v
+        qkv = self.qkv(x)  # [B_, N, 3*C]
+        # 将 qkv 拆分为 q, k, v，并reshape为多头的形式
+        qkv = qkv.reshape(B_, N, 3, self.num_heads, C // self.num_heads)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # 现在形状: [3, B_, num_heads, N, head_dim]
+        q, k, v = (
+            qkv[0],
+            qkv[1],
+            qkv[2],
+        )  # 分别取出 q, k, v，形状: [B_, num_heads, N, head_dim]
+
+        # 2. 计算注意力分数
+        q = q * self.scale  # 缩放查询向量
+        attn = q @ k.transpose(
+            -2, -1
+        )  # 矩阵乘法计算 q 和 k^T 的相关性，形状: [B_, num_heads, N, N]
+
+        # 添加相对位置偏差，每个头都有一组偏差值
+        # 根据预先计算的 relative_position_index 从 bias_table 中取出偏差值
+        Wh, Ww = self.window_size
+        # 获取 shape 为 (N, N, num_heads) 的偏差矩阵
+        relative_position_bias = self.relative_position_bias_table[
+            self.relative_position_index.view(-1)  # 将2D索引展平为1D索引
+        ]
+        relative_position_bias = relative_position_bias.view(
+            Wh * Ww, Wh * Ww, -1
+        )  # 恢复为 (N, N, num_heads)
+        relative_position_bias = relative_position_bias.permute(
+            2, 0, 1
+        ).contiguous()  # 转为 (num_heads, N, N)
+        attn = attn + relative_position_bias.unsqueeze(
+            0
+        )  # 将偏差添加到注意力得分 (broadcast到batch维度)
+
+        # 如果提供了 mask（移位窗口情况），则加上 mask（无效位置为 -inf，会在softmax时变为0）
+        if mask is not None:
+            # 假设 mask.shape = (num_windows, N, N)
+            nw = mask.shape[0]  # 每个批次中的窗口数
+            attn = attn.view(B_ // nw, nw, self.num_heads, N, N)
+            attn = attn + mask.unsqueeze(1).unsqueeze(0)  # 对应加上mask
+            attn = attn.view(-1, self.num_heads, N, N)  # 展平回原来的形状
+
+        # 3. 计算注意力权重并应用 dropout
+        attn = self.softmax(attn)  # 对最后两个维度(N, N)做softmax，得到注意力矩阵
+        attn = self.attn_drop(attn)  # 可选的dropout
+
+        # 4. 将注意力权重应用到 v 上
+        x = attn @ v  # [B_, num_heads, N, head_dim]
+        x = x.transpose(1, 2).reshape(B_, N, C)  # 合并多头结果，形状: [B_, N, C]
+
+        # 5. 输出投影
+        x = self.proj(x)  # [B_, N, C]
+        x = self.proj_drop(x)  # 应用输出dropout
+        return x
+
+
+def window_reverse(
+    windows: torch.Tensor, window_size: int, H: int, W: int
+) -> torch.Tensor:
+    """
+    将窗口张量恢复为原始特征图。
+    参数:
+        windows (Tensor): 窗口张量，形状 (B*num_windows, window_size, window_size, C)。
+        window_size (int): 窗口大小（高度和宽度）。
+        H (int): 原始特征图的高度。
+        W (int): 原始特征图的宽度。
+    返回:
+        Tensor: 恢复后的特征图，形状为 (B, H, W, C)。
+    """
+    # B 是批大小，计算方法：窗口总数 = (H/window_size)*(W/window_size)*B
+    # 因此 B = windows.shape[0] / ((H/window_size)*(W/window_size))
+    B = int(windows.shape[0] / ((H // window_size) * (W // window_size)))
+    # 恢复视图，将张量reshape回 (B, num_windows_H, num_windows_W, window_size, window_size, C)
+    x = windows.view(
+        B, H // window_size, W // window_size, window_size, window_size, -1
+    )
+    # permute调整回 (B, H//window_size, window_size, W//window_size, window_size, C)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+    # 最终reshape为 (B, H, W, C)
+    x = x.view(B, H, W, -1)
+    return x
+
+
+class WindowAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        dim,
+        window_size,
+        num_heads,
+        qkv_bias=True,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+    ):
+        super().__init__()
+        self.wa = WindowAttention(
+            dim=dim,
+            window_size=window_size,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+        )
+        self.norm1 = nn.LayerNorm(dim)
+        self.mlp = Mlp(dim, int(dim * 4), drop=0.0)
+        self.norm2 = nn.LayerNorm(dim)
+
+    def forward(self, x, mask=None):
+        b, c, h, w = x.shape
+        x = x.permute(0, 2, 3, 1)  # 调整维度顺序，使通道维度在最后
+        x = x + window_reverse(
+            self.wa(self.norm1(window_partition(x, self.wa.window_size[0])), mask=mask),
+            self.wa.window_size[0],
+            h,
+            w,
+        )
+        x = x + self.mlp(self.norm2(x))
+        x = x.permute(0, 3, 1, 2)
+        return x
 
 
 class MultiQueryAttentionV2(nn.Module):
@@ -190,15 +418,15 @@ class OriginAttention(nn.Module):
 
 
 class AttentionFFN(nn.Module):
-    def __init__(self, dim, heads=4, dim_head=64, downsample=4):
+    def __init__(self, dim, heads=4, dim_head=64, downsample=8):
         super().__init__()
         self.downsample = nn.AvgPool2d(downsample)
         self.attention = OriginAttention(dim, heads, dim_head)
         self.upsample = nn.Sequential(
-            nn.Upsample(scale_factor=downsample, mode="bilinear", align_corners=False),
-            nn.Conv2d(dim, dim, 3, padding=1),  # 上采样后卷积增强细节
+            nn.Upsample(scale_factor=downsample, mode="bicubic", align_corners=False),
+            nn.Conv2d(dim, dim, 3, 1, 1),  # 上采样后卷积增强细节
         )
-        self.ffn = Mlp(dim, int(dim * 4), use_conv=True)
+        self.ffn = Mlp(dim, int(dim * 4), use_conv=True, drop=0.12)
         self.ln1 = LayerNorm2d(dim)
         self.ln2 = LayerNorm2d(dim)
 
@@ -597,7 +825,7 @@ class SMFA(nn.Module):
         x_l = x * F.interpolate(
             self.gelu(self.linear_1(self.dp(x_s * self.alpha + x_v * self.belt))),
             size=(h, w),
-            mode="nearest",
+            mode="bicubic",
         )  # 空间调制
         y_d = self.lde(y)  # 超分辨率混合专家特征提取
         return self.linear_2(self.dp(y_d + x_l))
@@ -617,8 +845,7 @@ class Fusion(nn.Module):
         self.smfa = SMFA(dim, smfa_growth, snfa_dropout)
         self.pcfn = PCFN(dim, pcfn_growth, p_rate, pcfn_dropout)  # 部分连接前馈网络
         self.lkfb = LKFB(dim, dim, conv=PartialBSConvU)  # 局部关键特征融合
-        self.main_attn = AttentionFFN(dim)  # 动态多层感知机
-        self.sub_attn = AttentionFFN(dim)  # 动态多层感知机
+        self.attn = AttentionFFN(dim)  # 动态多层感知机
         self.ln1 = LayerNorm2d(dim)  # Layer Normalization
         self.ln2 = LayerNorm2d(dim)  # Layer Normalization
         self.ln3 = LayerNorm2d(dim)  # Layer Normalization
@@ -633,12 +860,10 @@ class Fusion(nn.Module):
         Returns:
             torch.Tensor: 输出特征图。
         """
-        out = self.sub_attn(x)
         x = self.ln1(self.smfa(x)) + x
         x = self.ln2(self.pcfn(x)) + x
         x = self.ln3(self.lkfb(x)) + x
-        # x = self.main_attn(x) + out
-        x = self.main_attn(x) * F.sigmoid(out)
+        x = self.attn(x)
         return x
 
 
