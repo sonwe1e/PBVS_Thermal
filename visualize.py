@@ -4,7 +4,7 @@ from typing import Union, Tuple, Dict, Any, Optional
 from torch.utils.data import DataLoader
 import numpy as np
 from configs.option import get_option
-from tools.datasets.datasetsv2 import *
+from tools.datasets.datasetsv3 import *
 
 torch.set_float32_matmul_precision("high")
 
@@ -30,7 +30,7 @@ class ImageVisualizer:
         Returns:
             反归一化后的图像张量
         """
-        return image * 0.5 + 0.5
+        return image
         # return image * self.std + self.mean
 
     def plot_sr_grid(
@@ -127,13 +127,21 @@ def visualize_sr_datasets(
 
     # 获取训练集数据
     train_lr, train_hr = get_batch_data(next(iter(train_dataloader)))
+    # 打印训练集数据的形状和统计信息
+    print("Train LR shape:", train_lr.shape)
+    print("Train HR shape:", train_hr.shape)
+
     train_lr = train_lr[:num_pairs]
     train_hr = train_hr[:num_pairs]
 
     # 获取验证集数据
     valid_lr, valid_hr = get_batch_data(next(iter(valid_dataloader)))
-    valid_lr = valid_lr[:num_pairs]
-    valid_hr = valid_hr[:num_pairs]
+    # 打印验证集数据的形状和统计信息
+    print("Valid LR shape:", valid_lr.shape)
+    print("Valid HR shape:", valid_hr.shape)
+
+    valid_lr = valid_lr[:10]
+    valid_hr = valid_hr[:10]
 
     # 合并所有图像和生成标题
     all_images = []
@@ -145,7 +153,7 @@ def visualize_sr_datasets(
         titles.extend([f"Train LR", f"Train HR"])
 
     # 添加验证集样本
-    for i in range(num_pairs):
+    for i in range(10):
         all_images.extend([valid_lr[i], valid_hr[i]])
         titles.extend([f"Valid LR", f"Valid HR"])
 
@@ -165,7 +173,7 @@ def visualize_sr_datasets(
 def main():
     """主函数"""
     opt = get_option()
-    train_dataloader, valid_dataloader = get_dataloader(opt)
+    train_dataloader, valid_dataloader, _, _ = get_dataloader(opt)
 
     print("Starting SR data visualization...")
     visualize_sr_datasets(opt, train_dataloader, valid_dataloader)

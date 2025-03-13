@@ -1,6 +1,6 @@
 import torch
 from configs.option import get_option
-from tools.datasets.datasetsv2 import *
+from tools.datasets.datasetsv3 import *
 from tools.pl_tool import *
 import lightning.pytorch as pl
 from lightning.pytorch.loggers import WandbLogger
@@ -21,6 +21,7 @@ if __name__ == "__main__":
     from tools.models.lkfn import LKFN
     from tools.models.competition_backup import FusionNet
     from tools.models.mynet import FusionNet
+    from tools.models.efdn import EFDN
 
     # model = FusionNet(
     #     dim=opt.dim,
@@ -38,15 +39,16 @@ if __name__ == "__main__":
     # model = LKFN()
     # model = PNet()
     # model = SCNet()
-    model = FusionNet(
-        dim=opt.dim,
-        n_blocks=opt.n_blocks,
-        upscaling_factor=opt.upscaling_factor,
-    )
+    model = EFDN()
+    # model = FusionNet(
+    #     dim=opt.dim,
+    #     n_blocks=opt.n_blocks,
+    #     upscaling_factor=opt.upscaling_factor,
+    # )
     """模型编译"""
     # model = torch.compile(model)
     """导入数据集"""
-    train_dataloader, valid_dataloader = get_dataloader(opt)
+    train_dataloader, valid_dataloader, _, _ = get_dataloader(opt)
 
     """Lightning 模块定义"""
     wandb_logger = WandbLogger(

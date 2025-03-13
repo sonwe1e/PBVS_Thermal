@@ -1,34 +1,121 @@
 # ===== 实验环境配置 =====
 seed: 42  # 随机种子，用于确保实验的可重复性 
 # exp_name: "v10+lkfb_attn_woact"  # 实验名称
-exp_name: "v1_woattnffn_onlyblur"  # 实验名称
+exp_name: "efdn_adamw" # "v2_cat_backsmfa"  # 实验名称
 save_wandb: true  # 是否将训练过程的指标保存到 wandb
 project: "ImageSuperResolution"  # wandb 项目名称
 
 # ===== 数据集配置 =====
 data_path: "/media/hdd/sonwe1e/Competition/ImageSuperResolution/DF2K"  # 数据集路径
-num_workers: 8  # 用于数据加载的并行线程数
-extra_data: ''
+num_workers: 16  # 用于数据加载的并行线程数
+extra_data: 
+- "LISDV/0001000"
+- "LISDV/0002000"
+- "LISDV/0003000"
+- "LISDV/0004000"
+- "LISDV/0005000"
+- "LISDV/0006000"
+- "LISDV/0007000"
+- "LISDV/0008000"
+- "LISDV/0009000"
+- "LISDV/0010000"
+# - "LISDV/0011000"
+# - "LISDV/0012000"
+# - "LISDV/0013000"
+# - "LISDV/0014000"
+# - "LISDV/0015000"
+# - "LISDV/0016000"
+# - "LISDV/0017000"
+# - "LISDV/0018000"
+# - "LISDV/0019000"
+# - "LISDV/0020000"
+# - "LISDV/0021000"
+# - "LISDV/0022000"
+# - "LISDV/0023000"
+# - "LISDV/0024000"
+# - "LISDV/0025000"
+# - "LISDV/0026000"
+# - "LISDV/0027000"
+# - "LISDV/0028000"
+# - "LISDV/0029000"
+# - "LISDV/0030000"
+# - "LISDV/0031000"
+# - "LISDV/0032000"
+# - "LISDV/0033000"
+# - "LISDV/0034000"
+# - "LISDV/0035000"
+# - "LISDV/0036000"
+# - "LISDV/0037000"
+# - "LISDV/0038000"
+# - "LISDV/0039000"
+# - "LISDV/0040000"
+# - "LISDV/0041000"
+# - "LISDV/0042000"
+# - "LISDV/0043000"
+# - "LISDV/0044000"
+# - "LISDV/0045000"
+# - "LISDV/0046000"
+# - "LISDV/0047000"
+# - "LISDV/0048000"
+# - "LISDV/0049000"
+# - "LISDV/0050000"
+# - "LISDV/0051000"
+# - "LISDV/0052000"
+# - "LISDV/0053000"
+# - "LISDV/0054000"
+# - "LISDV/0055000"
+# - "LISDV/0056000"
+# - "LISDV/0057000"
+# - "LISDV/0058000"
+# - "LISDV/0059000"
+# - "LISDV/0060000"
+# - "LISDV/0061000"
+# - "LISDV/0062000"
+# - "LISDV/0063000"
+# - "LISDV/0064000"
+# - "LISDV/0065000"
+# - "LISDV/0066000"
+# - "LISDV/0067000"
+# - "LISDV/0068000"
+# - "LISDV/0069000"
+# - "LISDV/0070000"
+# - "LISDV/0071000"
+# - "LISDV/0072000"
+# - "LISDV/0073000"
+# - "LISDV/0074000"
+# - "LISDV/0075000"
+# - "LISDV/0076000"
+# - "LISDV/0077000"
+# - "LISDV/0078000"
+# - "LISDV/0079000"
+# - "LISDV/0080000"
+# - "LISDV/0081000"
+# - "LISDV/0082000"
+# - "LISDV/0083000"
+# - "LISDV/0084000"
+# - "LISDV/0085000"
 
 # ===== 模型配置 =====
 resume: null
 
 # ===== 模型配置 =====
 upscaling_factor: 4
-dim: 64
-n_blocks: 6
+dim: 32
+n_blocks: 8
 
 # ===== 优化器配置 =====
 learning_rate: 0.0008  # 学习率
 pct_start: 0.06
 weight_decay: 0.0005  # 权重衰减系数，用于防止过拟合
-beta2: 0.95  # Adam 优化器的 beta2 参数
+beta2: 0.999  # Adam 优化器的 beta2 参数
 
 # ===== 训练配置 =====
-batch_size: 84  # 批次大小
-epochs: 500  # 训练的总轮数
+batch_size: 64  # 批次大小
+epochs: 2000  # 训练的总轮数
+use_ema: false
+ema_decay: 0.9999
 devices: 
-- 1
+- 3
 precision: "32"  # 训练使用的精度模式，常见选择包括 32，16，bf16-mixed
 gradient_clip_val: 4.0  # 梯度裁剪的最大值，用于防止梯度爆炸，默认不使用
 accumulate_grad_batches: 1  # 梯度累积的 batch 数，用于模拟更大的 batch size，默认不使用

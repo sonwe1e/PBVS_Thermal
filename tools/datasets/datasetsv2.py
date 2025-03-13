@@ -215,8 +215,8 @@ class ImageDataset(data.Dataset):
                 ),
                 interpolation=cv2.INTER_CUBIC,
             )
-        lr_image = torch.from_numpy(lr_image).permute(2, 0, 1).float() / 127.5 - 1
-        hr_image = torch.from_numpy(hr_image).permute(2, 0, 1).float() / 127.5 - 1
+        lr_image = torch.from_numpy(lr_image).permute(2, 0, 1).float() / 255.0
+        hr_image = torch.from_numpy(hr_image).permute(2, 0, 1).float() / 255.0
 
         if lr_image is not None and hr_image is not None:
             return {"lr_image": lr_image.float(), "hr_image": hr_image.float()}
@@ -238,7 +238,7 @@ class ImageDataset(data.Dataset):
         print(f"开始使用多线程预加载 {len(self.image_list)} 张图像...")
 
         # 创建进度条
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
             # 提交所有任务
             future_to_path = {
                 executor.submit(self._load_image, path): path
@@ -247,7 +247,7 @@ class ImageDataset(data.Dataset):
 
             # 使用tqdm创建进度条
             with tqdm(
-                total=len(self.image_list), desc="加载图像", mininterval=0.5
+                total=len(self.image_list), desc="loading", mininterval=0.5
             ) as pbar:
                 for future in concurrent.futures.as_completed(future_to_path):
                     path = future_to_path[future]
@@ -296,4 +296,5 @@ if __name__ == "__main__":
 
     for i, batch in enumerate(train_dataloader):
         print(batch["lr_image"].shape, batch["hr_image"].shape)
+        print(batch["lr_image"].max(), batch["lr_image"].min())
         break
