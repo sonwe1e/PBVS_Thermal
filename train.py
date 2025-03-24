@@ -6,8 +6,6 @@ import lightning.pytorch as pl
 from lightning.pytorch.loggers import WandbLogger
 import wandb
 import os
-import time
-
 
 torch.set_float32_matmul_precision("high")
 
@@ -22,7 +20,11 @@ if __name__ == "__main__":
     from tools.models.competition_backup import FusionNet
     from tools.models.mynet import FusionNet
     from tools.models.efdn import EFDN
+    from tools.models.catanet import CATANet
+    from tools.models.swinir import SwinIR
+    from tools.models.esrt import ESRT
 
+    # model = ESRT(upscale=2)
     # model = FusionNet(
     #     dim=opt.dim,
     #     n_blocks=opt.n_blocks,
@@ -36,14 +38,29 @@ if __name__ == "__main__":
     #     },
     # )
     # model = Ensemble()
-    # model = LKFN()
+    model = LKFN()
     # model = PNet()
     # model = SCNet()
-    model = EFDN()
+    # model = EFDN()
     # model = FusionNet(
     #     dim=opt.dim,
     #     n_blocks=opt.n_blocks,
     #     upscaling_factor=opt.upscaling_factor,
+    # )
+    # model = CATANet(upscale=opt.upscaling_factor)
+    # window_size = 8
+    # height = (128 // opt.upscaling_factor // window_size + 1) * window_size
+    # width = (128 // opt.upscaling_factor // window_size + 1) * window_size
+    # model = SwinIR(
+    #     upscale=opt.upscaling_factor,
+    #     img_size=(height, width),
+    #     window_size=window_size,
+    #     img_range=1.0,
+    #     depths=[6, 6, 6, 6],
+    #     embed_dim=60,
+    #     num_heads=[6, 6, 6, 6],
+    #     mlp_ratio=2,
+    #     upsampler="pixelshuffledirect",
     # )
     """模型编译"""
     # model = torch.compile(model)

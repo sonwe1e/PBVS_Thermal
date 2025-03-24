@@ -1,154 +1,155 @@
 import os
 import random
-import glob
 import cv2
 import torch
 import torch.utils.data as data
 import queue as Queue
 import threading
 from configs.option import get_option
-from tqdm import tqdm
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict, Tuple
 
 
 class PrefetchGenerator(threading.Thread):
-    """A general prefetch generator.
+    """A thread-based generator for prefetching data in the background.
 
-    Reference: https://stackoverflow.com/questions/7323664/python-generator-pre-fetch
+    Inspired by: https://stackoverflow.com/questions/7323664/python-generator-pre-fetch
 
     Args:
-        generator: Python generator.
-        num_prefetch_queue (int): Number of prefetch queue.
+        generator: The source generator to prefetch from.
+        max_queue_size (int): Maximum size of the prefetch queue.
     """
 
-    def __init__(self, generator, num_prefetch_queue):
-        threading.Thread.__init__(self)
-        self.queue = Queue.Queue(num_prefetch_queue)
+    def __init__(self, generator, max_queue_size):
+        super().__init__(daemon=True)
+        self.queue = Queue.Queue(max_queue_size)
         self.generator = generator
-        self.daemon = True
         self.start()
 
     def run(self):
+        """Fills the queue with items from the generator."""
         for item in self.generator:
             self.queue.put(item)
-        self.queue.put(None)
+        self.queue.put(None)  # Sentinel to indicate end
 
     def __next__(self):
-        next_item = self.queue.get()
-        if next_item is None:
+        item = self.queue.get()
+        if item is None:
             raise StopIteration
-        return next_item
+        return item
 
     def __iter__(self):
         return self
 
 
 class PrefetchDataLoader(data.DataLoader):
-    """Prefetch version of dataloader.
+    """A DataLoader enhanced with prefetching capabilities.
 
-    Reference: https://github.com/IgorSusmelj/pytorch-styleguide/issues/5#
+    Adapted from: https://github.com/IgorSusmelj/pytorch-styleguide/issues/5#
 
     Args:
-        num_prefetch_queue (int): Number of prefetch queue.
-        kwargs (dict): Other arguments for dataloader.
+        max_queue_size (int): Maximum size of the prefetch queue.
+        **kwargs: Arguments passed to torch.utils.data.DataLoader.
     """
 
-    def __init__(self, num_prefetch_queue, **kwargs):
-        self.num_prefetch_queue = num_prefetch_queue
-        super(PrefetchDataLoader, self).__init__(**kwargs)
+    def __init__(self, max_queue_size, **kwargs):
+        self.max_queue_size = max_queue_size
+        super().__init__(**kwargs)
 
     def __iter__(self):
-        return PrefetchGenerator(super().__iter__(), self.num_prefetch_queue)
+        return PrefetchGenerator(super().__iter__(), self.max_queue_size)
 
 
 class CPUPrefetcher:
-    """CPU prefetcher.
+    """A simple CPU-based prefetcher for data loading.
 
     Args:
-        loader: Dataloader.
+        dataloader: The DataLoader to prefetch from.
     """
 
-    def __init__(self, loader):
-        self.ori_loader = loader
-        self.loader = iter(loader)
+    def __init__(self, dataloader):
+        self.original_loader = dataloader
+        self.iterator = iter(dataloader)
 
     def next(self):
+        """Fetches the next batch or None if exhausted."""
         try:
-            return next(self.loader)
+            return next(self.iterator)
         except StopIteration:
             return None
 
     def reset(self):
-        self.loader = iter(self.ori_loader)
+        """Resets the iterator to the beginning."""
+        self.iterator = iter(self.original_loader)
 
 
 class CUDAPrefetcher:
-    """CUDA prefetcher.
+    """A CUDA-based prefetcher for asynchronous data loading to GPU.
 
     Reference: https://github.com/NVIDIA/apex/issues/304#
-
-    It may consume more GPU memory.
+    Note: May increase GPU memory usage.
 
     Args:
-        loader: Dataloader.
-        opt (dict): Options.
+        dataloader: The DataLoader to prefetch from.
+        options: Configuration options with device settings.
     """
 
-    def __init__(self, loader, opt):
-        self.ori_loader = loader
-        self.loader = iter(loader)
-        self.opt = opt
-        self.stream = torch.cuda.Stream()
+    def __init__(self, dataloader, options):
+        self.original_loader = dataloader
+        self.iterator = iter(dataloader)
+        self.options = options
         self.device = torch.device(
-            f"cuda:{opt.devices[0]}" if len(opt.devices) != 0 else "cpu"
+            f"cuda:{options.devices[0]}" if options.devices else "cpu"
         )
-        self.preload()
+        self.stream = torch.cuda.Stream(self.device)
+        self._preload()
 
-    def preload(self):
+    def _preload(self):
+        """Loads the next batch into GPU memory asynchronously."""
         try:
-            self.batch = next(self.loader)  # self.batch is a dict
+            self.current_batch = next(self.iterator)
         except StopIteration:
-            self.batch = None
-            return None
-        # put tensors to gpu
+            self.current_batch = None
+            return
         with torch.cuda.stream(self.stream):
-            for k, v in self.batch.items():
-                if torch.is_tensor(v):
-                    self.batch[k] = self.batch[k].to(
+            for key, value in self.current_batch.items():
+                if torch.is_tensor(value):
+                    self.current_batch[key] = value.to(
                         device=self.device, non_blocking=True
                     )
 
     def next(self):
-        torch.cuda.current_stream().wait_stream(self.stream)
-        batch = self.batch
-        self.preload()
+        """Returns the current batch and preloads the next."""
+        torch.cuda.current_stream(self.device).wait_stream(self.stream)
+        batch = self.current_batch
+        self._preload()
         return batch
 
     def reset(self):
-        self.loader = iter(self.ori_loader)
-        self.preload()
+        """Resets the iterator and preloads the first batch."""
+        self.iterator = iter(self.original_loader)
+        self._preload()
 
 
-# 新增：可枚举的预取器迭代器类
 class PrefetcherIterator:
-    """可迭代的预取器包装类，使预取器可以在for循环中使用enumerate。
+    """An iterable wrapper for prefetchers, supporting enumeration.
 
     Args:
-        prefetcher: CPU或CUDA预取器。
+        prefetcher: Either a CPUPrefetcher or CUDAPrefetcher instance.
+        length (int, optional): Total number of batches.
     """
 
     def __init__(self, prefetcher, length=None):
         self.prefetcher = prefetcher
         self.length = length
-        self.iterator = None
 
     def __iter__(self):
         self.prefetcher.reset()
         batch = self.prefetcher.next()
+        indices = range(self.length) if self.length is not None else iter(int, 1)
 
-        iterator = range(self.length) if self.length is not None else iter(int, 1)
-
-        for i in iterator:
+        for idx in indices:
             if batch is None:
                 break
             yield batch
@@ -159,249 +160,261 @@ class PrefetcherIterator:
 
 
 class ImageDataset(data.Dataset):
-    """
-    图像数据集类。
+    """A dataset class for loading paired LR and HR images with memory prefetching.
 
     Args:
-        phase (str): 数据集阶段，'train' 或 'valid'。
-        opt (object): 配置选项。
-        train_transform (callable, optional): 训练数据转换函数。
-        valid_transform (callable, optional): 验证数据转换函数。
+        phase (str): Dataset phase ('train' or 'valid').
+        options: Configuration options.
+        load_to_memory (bool): Whether to preload main dataset to memory (default: True).
+        load_extra_to_memory (bool): Whether to preload extra datasets to memory (default: False).
     """
 
-    def __init__(self, phase, opt):
+    def __init__(
+        self,
+        phase: str,
+        options,
+        load_to_memory: bool = True,
+        load_extra_to_memory: bool = False,
+    ):
         self.phase = phase
-        self.opt = opt
-        self.upscaling_factor = opt.upscaling_factor
+        self.options = options
+        self.scale = options.upscaling_factor
+        self.load_to_memory = load_to_memory
+        self.load_extra_to_memory = load_extra_to_memory
 
-        # 数据路径
-        self.data_path = opt.data_path
-        self.hr_path = os.path.join(self.data_path, phase)
+        # Main data paths
+        self.hr_path = (
+            os.path.join(options.data_path, "HR")
+            if phase == "train"
+            else "SR_Test/Set5/HR"
+        )
+        self.lr_path = (
+            os.path.join(options.data_path, f"x{self.scale}")
+            if phase == "train"
+            else f"SR_Test/Set5/x{self.scale}"
+        )
 
-        # 高分辨率图像路径列表
-        self.hr_image_paths = [
-            os.path.join(self.hr_path, name) for name in os.listdir(self.hr_path)
-        ]
-        self.dynamic_hr_image_paths = []
-        if self.phase == "train" and hasattr(opt, "extra_data"):
-            self._load_extra_data()
-
-        self.image_list = self.hr_image_paths
-
-        # 加载数据到内存中
-        self.loaded_images = {}  # 存储已加载的图像
-        self.load_images_in_parallel()
-
-        self.image_list = self.image_list + self.dynamic_hr_image_paths
-
-    def _load_extra_data(self):
-        """加载额外的训练数据。"""
-        extra_data_paths = self.opt.extra_data
-        for extra_data_path in extra_data_paths:
-            if os.path.isdir(extra_data_path):
-                image_extensions = ["*.png", "*.bmp", "*.jpg", "*.jpeg"]
-                for ext in image_extensions:
-                    self.dynamic_hr_image_paths.extend(
-                        glob.glob(os.path.join(extra_data_path, ext))
-                    )
-                    print(
-                        f"加载额外数据: {extra_data_path} 中的图像文件: {len(self.dynamic_hr_image_paths)}"
-                    )
-            else:
-                print(
-                    f"警告: opt.extra_data 路径 '{extra_data_path}' 不是有效目录。将不会加载此路径的额外数据。"
+        # Extra data paths from opt.extra_data
+        self.extra_hr_paths: List[str] = []
+        self.extra_lr_paths: List[str] = []
+        if hasattr(options, "extra_data") and options.extra_data:
+            for extra_path in options.extra_data:
+                self.extra_hr_paths.append(
+                    os.path.join(extra_path, "HR")
+                    if phase == "train"
+                    else "SR_Test/Set5/HR"
+                )
+                self.extra_lr_paths.append(
+                    os.path.join(extra_path, f"x{self.scale}")
+                    if phase == "train"
+                    else f"SR_Test/Set5/x{self.scale}"
                 )
 
-    def __getitem__(self, index):
-        """
-        获取单个数据样本。
+        # Collect all image names
+        self.image_names: List[Tuple[str, str, str]] = []  # (name, hr_path, lr_path)
+        self._collect_image_names()
 
-        Args:
-            index (int): 样本索引。
+        self.repeat = 10 if phase == "train" else 1
+        self.memory_cache: Dict[
+            str, Tuple[np.ndarray, np.ndarray]
+        ] = {}  # {image_name: (lr_img, hr_img)}
 
-        Returns:
-            dict: 包含低分辨率图像和高分辨率图像的字典，如果图像加载失败则返回None。
-        """
-        image_path = self.image_list[index]
+        # Load data to memory if enabled
+        self._preload_to_memory()
 
-        if image_path in self.loaded_images:  # 从缓存中获取图像
-            hr_image = self.loaded_images[image_path]
-        else:
-            hr_image = self._load_image(image_path)
+    def _collect_image_names(self):
+        """Collects image names from all data paths."""
+        # Main dataset
+        main_images = os.listdir(self.hr_path)
+        for img_name in main_images:
+            self.image_names.append((img_name, self.hr_path, self.lr_path))
 
-        if self.phase == "train":
-            h, w, _ = hr_image.shape
-            crop_size = 256
-            start_h = random.randint(0, h - crop_size)
-            start_w = random.randint(0, w - crop_size)
-            hr_image = hr_image[
-                start_h : start_h + crop_size, start_w : start_w + crop_size
-            ]
+        # Extra datasets
+        for hr_path, lr_path in zip(self.extra_hr_paths, self.extra_lr_paths):
+            extra_images = os.listdir(hr_path)
+            for img_name in extra_images:
+                self.image_names.append((img_name, hr_path, lr_path))
 
-            # 下采样得到 lr_image
-            lr_image = cv2.resize(
-                hr_image,
-                (
-                    hr_image.shape[1] // self.upscaling_factor,
-                    hr_image.shape[0] // self.upscaling_factor,
-                ),
-                interpolation=cv2.INTER_CUBIC,
-            )
-        else:
-            h, w, _ = hr_image.shape
-            target_h = 1536
-            target_w = 2048
-
-            # Padding to reach target size
-            if h < target_h or w < target_w:
-                pad_h = max(0, target_h - h)
-                pad_w = max(0, target_w - w)
-                top = pad_h // 2
-                bottom = pad_h - top
-                left = pad_w // 2
-                right = pad_w - left
-                hr_image = cv2.copyMakeBorder(
-                    hr_image, top, bottom, left, right, cv2.BORDER_CONSTANT
-                )
-
-            if hr_image.shape[0] > target_h or hr_image.shape[1] > target_w:
-                h, w = hr_image.shape[:2]
-                start_h = (h - target_h) // 2
-                start_w = (w - target_w) // 2
-                hr_image = hr_image[
-                    start_h : start_h + target_h, start_w : start_w + target_w
-                ]
-            lr_image = cv2.resize(
-                hr_image,
-                (
-                    hr_image.shape[1] // self.upscaling_factor,
-                    hr_image.shape[0] // self.upscaling_factor,
-                ),
-                interpolation=cv2.INTER_CUBIC,
-            )
-        lr_image = torch.from_numpy(lr_image).permute(2, 0, 1).float() / 255.0
-        hr_image = torch.from_numpy(hr_image).permute(2, 0, 1).float() / 255.0
-
-        if lr_image is not None and hr_image is not None:
-            return {"lr_image": lr_image.float(), "hr_image": hr_image.float()}
-        else:
-            return None
-
-    def __len__(self):
-        return len(self.image_list)
-
-    def _load_image(self, path):
-        img = cv2.imread(path, cv2.IMREAD_COLOR)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    def _load_image(self, path: str) -> np.ndarray:
+        """Loads an image in RGB format using OpenCV."""
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)[:, :, [2, 1, 0]]  # BGR to RGB
+        if img is None:
+            raise ValueError(f"Failed to load image: {path}")
         return img
 
-    def load_images_in_parallel(self):
-        """使用多线程预加载所有图像。"""
-        import concurrent.futures
+    def _preload_image(
+        self, img_name: str, hr_path: str, lr_path: str
+    ) -> Tuple[str, np.ndarray, np.ndarray]:
+        """Loads a single image pair for preloading."""
+        hr_img = self._load_image(os.path.join(hr_path, img_name))
+        lr_img = self._load_image(os.path.join(lr_path, img_name))
+        return img_name, lr_img, hr_img
 
-        print(f"开始使用多线程预加载 {len(self.image_list)} 张图像...")
+    def _preload_to_memory(self):
+        """Preloads images to memory using parallel loading."""
+        if not self.load_to_memory and not self.load_extra_to_memory:
+            return
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=24) as executor:
-            future_to_path = {
-                executor.submit(self._load_image, path): path
-                for path in self.image_list
-            }
+        tasks = []
+        with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+            for img_name, hr_path, lr_path in self.image_names:
+                # Load main dataset if enabled, extra datasets if load_extra_to_memory is True
+                is_main_dataset = hr_path == self.hr_path
+                should_load = (is_main_dataset and self.load_to_memory) or (
+                    not is_main_dataset and self.load_extra_to_memory
+                )
+                if should_load:
+                    tasks.append(
+                        executor.submit(self._preload_image, img_name, hr_path, lr_path)
+                    )
 
-            # tqdm is excellent for progress bars, keep using it!
-            with tqdm(
-                total=len(self.image_list),
-                desc="Loading Images",
-                mininterval=0.5,
-                unit="img",
-            ) as pbar:
-                for future in concurrent.futures.as_completed(future_to_path):
-                    path = future_to_path[future]
-                    try:
-                        # 3. Store Directly: You're already doing this correctly!
-                        self.loaded_images[path] = future.result()
-                    except Exception as e:
-                        # 4.  More Specific Error Handling (Optional but Good Practice)
-                        print(f"Error loading image {path}: {e}")
-                        # Consider logging the error, or adding the path to a list of failed images.
-                    finally:
-                        pbar.update(1)
+            # Collect results
+            for future in tasks:
+                try:
+                    img_name, lr_img, hr_img = future.result()
+                    self.memory_cache[img_name] = (lr_img, hr_img)
+                except Exception as e:
+                    print(f"Warning: Failed to preload {img_name}: {e}")
+
+    def _get_patch(
+        self, lr_img: np.ndarray, hr_img: np.ndarray, patch_size: int, scale: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Extracts matching patches from LR and HR images."""
+        lr_h, lr_w = lr_img.shape[:2]
+        lr_patch_size = patch_size // scale
+
+        lr_x = random.randrange(0, lr_w - lr_patch_size + 1)
+        lr_y = random.randrange(0, lr_h - lr_patch_size + 1)
+        hr_x, hr_y = scale * lr_x, scale * lr_y
+
+        lr_patch = lr_img[lr_y : lr_y + lr_patch_size, lr_x : lr_x + lr_patch_size]
+        hr_patch = hr_img[hr_y : hr_y + patch_size, hr_x : hr_x + patch_size]
+
+        return lr_patch, hr_patch
+
+    def _augment(
+        self, lr_img: np.ndarray, hr_img: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Applies random augmentation (rotation and flips)."""
+        if random.random() < 0.5:
+            rotations = random.randint(0, 3)
+            lr_img, hr_img = map(lambda x: np.rot90(x, rotations), (lr_img, hr_img))
+
+        if random.random() < 0.5:
+            lr_img, hr_img = map(np.flipud, (lr_img, hr_img))
+
+        if random.random() < 0.5:
+            lr_img, hr_img = map(np.fliplr, (lr_img, hr_img))
+
+        return lr_img, hr_img
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        """Returns a single data sample as a dictionary."""
+        idx = index % len(self.image_names)
+        img_name, hr_path, lr_path = self.image_names[idx]
+
+        # Load from memory if available, otherwise from disk
+        if img_name in self.memory_cache:
+            lr_img, hr_img = self.memory_cache[img_name]
+            lr_img, hr_img = lr_img.copy(), hr_img.copy()  # Avoid modifying cached data
+        else:
+            hr_img = self._load_image(os.path.join(hr_path, img_name))
+            lr_img = self._load_image(os.path.join(lr_path, img_name))
+
+        if self.phase == "train":
+            lr_img, hr_img = self._get_patch(
+                lr_img, hr_img, self.options.img_size, self.scale
+            )
+            lr_img, hr_img = self._augment(lr_img, hr_img)
+        else:
+            lr_h, lr_w = lr_img.shape[:2]
+            hr_img = hr_img[: lr_h * self.scale, : lr_w * self.scale]
+
+        lr_tensor = (
+            torch.from_numpy(np.ascontiguousarray(lr_img)).permute(2, 0, 1).float()
+        )
+        hr_tensor = (
+            torch.from_numpy(np.ascontiguousarray(hr_img)).permute(2, 0, 1).float()
+        )
+
+        return {"lr_image": lr_tensor / 255.0, "hr_image": hr_tensor / 255.0}
+
+    def __len__(self) -> int:
+        return len(self.image_names) * self.repeat
 
 
-def get_dataloader(opt):
-    """
-    获取数据加载器。
+def get_dataloader(options):
+    """Creates and returns prefetching data iterators and raw dataloaders."""
+    train_dataset = ImageDataset(
+        "train", options, load_to_memory=True, load_extra_to_memory=False
+    )
+    valid_dataset = ImageDataset(
+        "valid", options, load_to_memory=True, load_extra_to_memory=False
+    )
 
-    Args:
-        opt (object): 配置选项。
-
-    Returns:
-        tuple: 训练和验证数据的预取迭代器和原始加载器。
-    """
-    train_dataset = ImageDataset(phase="train", opt=opt)
-    valid_dataset = ImageDataset(phase="valid", opt=opt)
-
-    # 使用PrefetchDataLoader替代普通DataLoader
     train_dataloader = PrefetchDataLoader(
-        num_prefetch_queue=4,
+        max_queue_size=4,
         dataset=train_dataset,
-        batch_size=opt.batch_size,
+        batch_size=options.train_batch_size,
         shuffle=True,
-        num_workers=opt.num_workers,
+        num_workers=options.num_workers,
         pin_memory=True,
         drop_last=True,
     )
 
     valid_dataloader = PrefetchDataLoader(
-        num_prefetch_queue=4,
+        max_queue_size=4,
         dataset=valid_dataset,
-        batch_size=10,
+        batch_size=options.valid_batch_size,
         shuffle=False,
-        num_workers=opt.num_workers,
+        num_workers=options.num_workers,
         pin_memory=True,
     )
 
-    # 根据GPU可用性创建对应的预取器
-    if len(opt.devices) > 0 and torch.cuda.is_available():
-        train_prefetcher = CUDAPrefetcher(train_dataloader, opt)
-        valid_prefetcher = CUDAPrefetcher(valid_dataloader, opt)
-    else:
-        train_prefetcher = CPUPrefetcher(train_dataloader)
-        valid_prefetcher = CPUPrefetcher(valid_dataloader)
-
-    # 创建可迭代的预取器
-    train_iterator = PrefetcherIterator(
-        train_prefetcher,
-        length=len(train_dataset) // opt.batch_size,
+    prefetcher_cls = (
+        CUDAPrefetcher
+        if options.devices and torch.cuda.is_available()
+        else CPUPrefetcher
+    )
+    train_prefetcher = (
+        prefetcher_cls(train_dataloader, options)
+        if prefetcher_cls == CUDAPrefetcher
+        else prefetcher_cls(train_dataloader)
+    )
+    valid_prefetcher = (
+        prefetcher_cls(valid_dataloader, options)
+        if prefetcher_cls == CUDAPrefetcher
+        else prefetcher_cls(valid_dataloader)
     )
 
+    train_iterator = PrefetcherIterator(
+        train_prefetcher, len(train_dataset) // options.train_batch_size
+    )
     valid_iterator = PrefetcherIterator(
-        valid_prefetcher,
-        length=len(valid_dataset) // 10,
+        valid_prefetcher, len(valid_dataset) // options.valid_batch_size
     )
 
     return train_iterator, valid_iterator, train_dataloader, valid_dataloader
 
 
 if __name__ == "__main__":
-    opt = get_option()
+    options = get_option()
+    train_iter, valid_iter, train_dl, valid_dl = get_dataloader(options)
 
-    # 获取数据加载器和预取迭代器
-    train_iterator, valid_iterator, train_dataloader, valid_dataloader = get_dataloader(
-        opt
-    )
-
-    # 使用可枚举的预取迭代器
-    print("使用可枚举的预取迭代器：")
-    for i, batch in enumerate(train_iterator):
-        print(f"Batch {i}:", batch["lr_image"].shape, batch["hr_image"].shape)
-        print(batch["lr_image"].max(), batch["lr_image"].min())
-        if i >= 2:  # 只演示前几个批次
+    print("Using prefetch iterator:")
+    for i, batch in enumerate(train_iter):
+        print(f"Batch {i}: LR {batch['lr_image'].shape}, HR {batch['hr_image'].shape}")
+        print(
+            f"LR range: {batch['lr_image'].max():.2f} - {batch['lr_image'].min():.2f}"
+        )
+        if i >= 2:
             break
 
-    # 也可以直接使用原始dataloader
-    print("\n使用原始DataLoader：")
-    for i, batch in enumerate(train_dataloader):
-        print(f"Batch {i}:", batch["lr_image"].shape, batch["hr_image"].shape)
-        print(batch["lr_image"].max(), batch["lr_image"].min())
-        if i >= 2:  # 只演示前几个批次
+    print("\nUsing raw DataLoader:")
+    for i, batch in enumerate(train_dl):
+        print(f"Batch {i}: LR {batch['lr_image'].shape}, HR {batch['hr_image'].shape}")
+        print(
+            f"LR range: {batch['lr_image'].max():.2f} - {batch['lr_image'].min():.2f}"
+        )
+        if i >= 2:
             break

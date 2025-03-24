@@ -84,7 +84,7 @@ class ImageVisualizer:
         if title:
             plt.suptitle(title, y=0.98, fontsize=16)
         plt.tight_layout()
-        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        plt.savefig(save_path, dpi=400, bbox_inches="tight")
         plt.close(fig)
         return fig
 
@@ -112,7 +112,8 @@ def visualize_sr_datasets(
     opt: Any,
     train_dataloader: DataLoader,
     valid_dataloader: DataLoader,
-    num_pairs: int = 16,
+    train_num_pairs: int = 16,
+    valid_num_pairs: int = 0,
 ) -> None:
     """
     超分数据集可视化
@@ -126,13 +127,36 @@ def visualize_sr_datasets(
     visualizer = ImageVisualizer(opt)
 
     # 获取训练集数据
-    train_lr, train_hr = get_batch_data(next(iter(train_dataloader)))
+    # Collect images from 8 batches
+    train_dataloader_iter = iter(train_dataloader)
+    train_lr_list = []
+    train_hr_list = []
+
+    # Get required number of samples per batch
+    samples_per_batch = train_num_pairs // 8
+    remainder = train_num_pairs % 8
+
+    # Collect images from each batch
+    for i in range(8):
+        # Get batch
+        batch = next(train_dataloader_iter)
+        lr_batch, hr_batch = get_batch_data(batch)
+
+        # Take more samples from early batches if train_num_pairs isn't divisible by 8
+        samples_to_take = samples_per_batch + (1 if i < remainder else 0)
+
+        train_lr_list.append(lr_batch[:samples_to_take])
+        train_hr_list.append(hr_batch[:samples_to_take])
+
+    # Combine all batches
+    train_lr = torch.cat(train_lr_list, dim=0)
+    train_hr = torch.cat(train_hr_list, dim=0)
     # 打印训练集数据的形状和统计信息
     print("Train LR shape:", train_lr.shape)
     print("Train HR shape:", train_hr.shape)
 
-    train_lr = train_lr[:num_pairs]
-    train_hr = train_hr[:num_pairs]
+    train_lr = train_lr[:train_num_pairs]
+    train_hr = train_hr[:train_num_pairs]
 
     # 获取验证集数据
     valid_lr, valid_hr = get_batch_data(next(iter(valid_dataloader)))
@@ -140,22 +164,22 @@ def visualize_sr_datasets(
     print("Valid LR shape:", valid_lr.shape)
     print("Valid HR shape:", valid_hr.shape)
 
-    valid_lr = valid_lr[:10]
-    valid_hr = valid_hr[:10]
+    valid_lr = valid_lr[:valid_num_pairs]
+    valid_hr = valid_hr[:valid_num_pairs]
 
     # 合并所有图像和生成标题
     all_images = []
     titles = []
 
     # 添加训练集样本
-    for i in range(num_pairs):
+    for i in range(train_num_pairs):
         all_images.extend([train_lr[i], train_hr[i]])
-        titles.extend([f"Train LR", f"Train HR"])
+        titles.extend(["Train LR", "Train HR"])
 
     # 添加验证集样本
-    for i in range(10):
+    for i in range(valid_num_pairs):
         all_images.extend([valid_lr[i], valid_hr[i]])
-        titles.extend([f"Valid LR", f"Valid HR"])
+        titles.extend(["Valid LR", "Valid HR"])
 
     # 转换为张量
     combined_images = all_images
@@ -169,16 +193,14 @@ def visualize_sr_datasets(
         save_path="./SR_comparison.png",
     )
 
-
-def main():
     """主函数"""
+
+
+if __name__ == "__main__":  # Training settings
     opt = get_option()
+    from torch.utils.data import DataLoader
+
     train_dataloader, valid_dataloader, _, _ = get_dataloader(opt)
-
     print("Starting SR data visualization...")
-    visualize_sr_datasets(opt, train_dataloader, valid_dataloader)
+    visualize_sr_datasets(opt, train_dataloader, valid_dataloader, 64, 1)
     print("Visualization saved to ./visualization/SR_comparison.png")
-
-
-if __name__ == "__main__":
-    main()

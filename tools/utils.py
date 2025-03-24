@@ -32,18 +32,10 @@ def save_image_cv2(img_array, output_path):
 
 
 def infer_from_model(
-    model,
-    images_path,
-    output_path,
-    tta=False,
-    scale_factor=4,
-    device="cuda:0",
-    num_workers=16,  # Add num_workers for multithreading
+    model, images_path, output_path, tta=False, device="cuda:0", num_workers=16
 ):
-    # 设备选择
     model = model.to(device)
-
-    # 获取图像列表
+    model.eval()
     if os.path.isdir(images_path):
         image_files = sorted(
             glob.glob(os.path.join(images_path, "*.png"))
@@ -51,62 +43,68 @@ def infer_from_model(
         )
     else:
         image_files = [images_path]
-
-    # Ensure the output directory exists
     os.makedirs(output_path, exist_ok=True)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
         for img_path in tqdm(image_files, desc="Inferencing"):
-            # 加载图像
-            img = Image.open(img_path).convert("RGB")
-            # img_tensor = transforms.ToTensor()(img).to(device) * 2 - 1.0
-            img_tensor = transforms.ToTensor()(img).to(device)
+            img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+            if img is None:
+                print(f"Failed to load {img_path}")
+                continue
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img_tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+            img_tensor = img_tensor.unsqueeze(0).to(device)
 
-            # 添加batch维度
-            img_tensor = img_tensor.unsqueeze(0)
             with torch.no_grad():
-                output = model(img_tensor)
+                if tta:
+                    tta_imgs = [img_tensor]
+                    tta_imgs.extend(
+                        torch.rot90(img_tensor, k=i, dims=(2, 3)) for i in [1, 2, 3]
+                    )
+                    tta_imgs.extend(torch.flip(img, dims=(3,)) for img in tta_imgs[:])
+                    tta_outputs = [model(img) for img in tta_imgs]
 
-            # 后处理
-            # output = (output[0] + 1.0) * 127.5  # [-1,1] -> [0,255]
+                    output = torch.zeros_like(tta_outputs[0])
+                    for i, out in enumerate(tta_outputs[:4]):
+                        output += torch.rot90(out, k=-i % 4, dims=(2, 3))
+                    for i, out in enumerate(tta_outputs[4:]):
+                        output += torch.rot90(
+                            torch.flip(out, dims=(3,)), k=-i % 4, dims=(2, 3)
+                        )
+                    output /= 8
+                else:
+                    output = model(img_tensor)
+
+            # 检查输出范围
+            # print(f"Output range: {output.min():.2f} - {output.max():.2f}")
             output = output[0] * 255.0
             output = output.clamp(0, 255).cpu().numpy()
             output = np.transpose(output, (1, 2, 0)).astype(np.uint8)
 
-            # --- Use OpenCV and Multithreading for Saving ---
-            img_name = img_path.split("/")[-1]
+            img_name = os.path.splitext(os.path.basename(img_path))[0] + ".png"
             output_file_path = os.path.join(output_path, img_name)
             executor.submit(save_image_cv2, output, output_file_path)
         executor.shutdown(wait=True)
 
 
 def calculate_metrics(gt_img, pred_img):
-    """Calculates PSNR and SSIM between two images."""
+    """Calculates PSNR and SSIM between two images using the Y channel."""
     if gt_img.size != pred_img.size:
         pred_img = pred_img.resize(gt_img.size, Image.BICUBIC)
 
-    # 一次性转换为numpy数组
-    gt_np = np.array(gt_img).astype(np.float32)
-    pred_np = np.array(pred_img).astype(np.float32)
+    # Convert images to YCbCr
+    gt_ycbcr = gt_img.convert("YCbCr")
+    pred_ycbcr = pred_img.convert("YCbCr")
 
-    # 直接计算PSNR
-    psnr_value = psnr(gt_np, pred_np, data_range=255)
+    # Extract Y channel
+    gt_y = np.array(gt_ycbcr)[:, :, 0].astype(np.float32)
+    pred_y = np.array(pred_ycbcr)[:, :, 0].astype(np.float32)
 
-    # 优化SSIM计算
-    if len(gt_np.shape) == 3:  # 彩色图像
-        # 使用多通道SSIM计算而不是循环每个通道
-        ssim_value = 0
-        for i in range(gt_np.shape[2]):
-            ssim_value += ssim(
-                gt_np[:, :, i],
-                pred_np[:, :, i],
-                data_range=255,
-                gaussian_weights=True,
-                use_sample_covariance=False,
-            )
-        ssim_value /= gt_np.shape[2]
-    else:  # 灰度图像
-        ssim_value = ssim(gt_np, pred_np, data_range=255)
+    # Calculate PSNR and SSIM on the Y channel
+    psnr_value = psnr(gt_y, pred_y, data_range=255)
+    ssim_value = ssim(
+        gt_y, pred_y, data_range=255, gaussian_weights=True, use_sample_covariance=False
+    )
 
     return psnr_value, ssim_value
 
@@ -114,7 +112,7 @@ def calculate_metrics(gt_img, pred_img):
 def process_image(img_name, gt_path, pred_path):
     """Loads images, calculates metrics, and returns results."""
     gt_img_path = os.path.join(gt_path, img_name)
-    pred_img_path = os.path.join(pred_path, img_name.replace(".png", "x4.png"))
+    pred_img_path = os.path.join(pred_path, img_name)
 
     if not os.path.exists(pred_img_path):
         return img_name, None, None, None, None
@@ -134,12 +132,7 @@ def calculate_all_metrics(gt_path, pred_path):
     """Calculates metrics for all image pairs in the given directories."""
     # 预过滤文件
     gt_files = [f for f in os.listdir(gt_path) if f.endswith((".png", ".jpg"))]
-    pred_files = {
-        f.replace("x4.png", ".png")
-        for f in os.listdir(pred_path)
-        if f.endswith("x4.png")
-    }
-
+    pred_files = [f for f in os.listdir(pred_path) if f.endswith((".png", ".jpg"))]
     # 只处理两个目录中都存在的文件
     image_files = [f for f in gt_files if f in pred_files]
     results = []
