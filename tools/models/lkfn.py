@@ -1,6 +1,62 @@
 import torch
 from torch import nn as nn
 from torch.nn import functional as F
+from torch.nn import init as init
+from torch.nn.modules.batchnorm import _BatchNorm
+
+
+class DynamicTanh(nn.Module):
+    def __init__(self, normalized_shape, channels_last, alpha_init_value=0.5):
+        super().__init__()
+        self.normalized_shape = normalized_shape
+        self.alpha_init_value = alpha_init_value
+        self.channels_last = channels_last
+
+        self.alpha = nn.Parameter(torch.ones(1) * alpha_init_value)
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+
+    def forward(self, x):
+        x = torch.tanh(self.alpha * x)
+        if self.channels_last:
+            x = x * self.weight + self.bias
+        else:
+            x = x * self.weight[:, None, None] + self.bias[:, None, None]
+        return x
+
+    def extra_repr(self):
+        return f"normalized_shape={self.normalized_shape}, alpha_init_value={self.alpha_init_value}, channels_last={self.channels_last}"
+
+
+@torch.no_grad()
+def default_init_weights(module_list, scale=1, bias_fill=0, **kwargs):
+    """Initialize network weights.
+
+    Args:
+        module_list (list[nn.Module] | nn.Module): Modules to be initialized.
+        scale (float): Scale initialized weights, especially for residual
+            blocks. Default: 1.
+        bias_fill (float): The value to fill bias. Default: 0
+        kwargs (dict): Other arguments for initialization function.
+    """
+    if not isinstance(module_list, list):
+        module_list = [module_list]
+    for module in module_list:
+        for m in module.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, **kwargs)
+                m.weight.data *= scale
+                if m.bias is not None:
+                    m.bias.data.fill_(bias_fill)
+            elif isinstance(m, nn.Linear):
+                init.kaiming_normal_(m.weight, **kwargs)
+                m.weight.data *= scale
+                if m.bias is not None:
+                    m.bias.data.fill_(bias_fill)
+            elif isinstance(m, _BatchNorm):
+                init.constant_(m.weight, 1)
+                if m.bias is not None:
+                    m.bias.data.fill_(bias_fill)
 
 
 class BSConvU(nn.Module):
@@ -53,9 +109,9 @@ class PartialBSConvU(nn.Module):
         self,
         in_channels,
         out_channels,
-        kernel_size=3,
+        kernel_size=5,
         stride=1,
-        padding=1,
+        padding=2,
         dilation=1,
         bias=True,
         padding_mode="zeros",
@@ -84,8 +140,8 @@ class PartialBSConvU(nn.Module):
             kernel_size=kernel_size,
             stride=stride,
             padding=padding,
-            dilation=dilation,
-            groups=in_channels // scale,
+            dilation=1,
+            groups=self.remaining_channels,
             bias=bias,
             padding_mode=padding_mode,
         )
@@ -102,6 +158,7 @@ class PartialBSConvU(nn.Module):
 
 class Attention(nn.Module):
     def __init__(self, embed_dim, fft_norm="ortho"):
+        # bn_layer not used
         super(Attention, self).__init__()
         self.conv_layer1 = torch.nn.Conv2d(embed_dim, embed_dim // 2, 1, 1, 0)
         self.conv_layer2 = torch.nn.Conv2d(embed_dim // 2, embed_dim // 2, 1, 1, 0)
@@ -118,18 +175,19 @@ class Attention(nn.Module):
         imag = ffted.imag + self.conv_layer3(
             self.relu(self.conv_layer2(self.relu(self.conv_layer1(ffted.imag))))
         )
-
         ffted = torch.complex(real, imag)
+
         ifft_shape_slice = x.shape[-2:]
-        atten = torch.fft.irfftn(
+
+        output = torch.fft.irfftn(
             ffted, s=ifft_shape_slice, dim=fft_dim, norm=self.fft_norm
         )
 
-        return x * atten
+        return x * output
 
 
 class LKFB(nn.Module):
-    def __init__(self, in_channels, out_channels, atten_channels=None, conv=nn.Conv2d):
+    def __init__(self, in_channels, out_channels, atten_channels=None):
         super().__init__()
 
         self.dc = self.distilled_channels = in_channels // 2
@@ -140,11 +198,11 @@ class LKFB(nn.Module):
             self.atten_channels = atten_channels
 
         self.c1_d = nn.Conv2d(in_channels, self.dc, 1)
-        self.c1_r = conv(in_channels, self.rc, kernel_size=5, padding=2)
+        self.c1_r = PartialBSConvU(in_channels, self.rc, kernel_size=5, padding=2)
         self.c2_d = nn.Conv2d(self.rc, self.dc, 1)
-        self.c2_r = conv(self.rc, self.rc, kernel_size=5, padding=2)
+        self.c2_r = PartialBSConvU(self.rc, self.rc, kernel_size=5, padding=2)
         self.c3_d = nn.Conv2d(self.rc, self.dc, 1)
-        self.c3_r = conv(self.rc, self.rc, kernel_size=5, padding=6, dilation=3)
+        self.c3_r = PartialBSConvU(self.rc, self.rc, kernel_size=5, padding=2)
 
         self.c4 = BSConvU(self.rc, self.dc, kernel_size=3, padding=1)
         self.act = nn.GELU()
@@ -152,7 +210,9 @@ class LKFB(nn.Module):
         self.c5 = nn.Conv2d(self.dc * 4, self.atten_channels, 1, 1, 0)
         self.atten = Attention(self.atten_channels)
         self.c6 = nn.Conv2d(self.atten_channels, out_channels, 1, 1, 0)
-        self.pixel_norm = nn.LayerNorm(out_channels)
+        self.pixel_norm = nn.LayerNorm(out_channels)  # channel-wise
+        # self.pixel_norm = DynamicTanh(normalized_shape=out_channels, channels_last=True)
+        default_init_weights([self.pixel_norm], 0.1)
 
     def forward(self, input):
         distilled_c1 = self.act(self.c1_d(input))
@@ -218,72 +278,42 @@ class LKFN(nn.Module):
         self,
         num_in_ch=3,
         num_out_ch=3,
-        num_feat=28,
-        num_atten=28,
+        num_feat=56,
+        num_atten=56,
         num_block=8,
-        upscale=4,
+        upscale=2,
         num_in=4,
-        conv="PartialBSConvU",
         upsampler="pixelshuffledirect",
+        rgb_mean=(0.4488, 0.4371, 0.4040),
     ):
         super().__init__()
         self.num_in = num_in
-        if conv == "BSConvU":
-            self.conv = BSConvU
-        elif conv == "PartialBSConvU":
-            self.conv = PartialBSConvU
-        else:
-            raise NotImplementedError(f"conv {conv} is not supported yet.")
-        print(conv)
+        self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
         self.fea_conv = BSConvU(num_in_ch * num_in, num_feat, kernel_size=3, padding=1)
 
         self.B1 = LKFB(
-            in_channels=num_feat,
-            out_channels=num_feat,
-            atten_channels=num_atten,
-            conv=self.conv,
+            in_channels=num_feat, out_channels=num_feat, atten_channels=num_atten
         )
         self.B2 = LKFB(
-            in_channels=num_feat,
-            out_channels=num_feat,
-            atten_channels=num_atten,
-            conv=self.conv,
+            in_channels=num_feat, out_channels=num_feat, atten_channels=num_atten
         )
         self.B3 = LKFB(
-            in_channels=num_feat,
-            out_channels=num_feat,
-            atten_channels=num_atten,
-            conv=self.conv,
+            in_channels=num_feat, out_channels=num_feat, atten_channels=num_atten
         )
         self.B4 = LKFB(
-            in_channels=num_feat,
-            out_channels=num_feat,
-            atten_channels=num_atten,
-            conv=self.conv,
+            in_channels=num_feat, out_channels=num_feat, atten_channels=num_atten
         )
         self.B5 = LKFB(
-            in_channels=num_feat,
-            out_channels=num_feat,
-            atten_channels=num_atten,
-            conv=self.conv,
+            in_channels=num_feat, out_channels=num_feat, atten_channels=num_atten
         )
         self.B6 = LKFB(
-            in_channels=num_feat,
-            out_channels=num_feat,
-            atten_channels=num_atten,
-            conv=self.conv,
+            in_channels=num_feat, out_channels=num_feat, atten_channels=num_atten
         )
         self.B7 = LKFB(
-            in_channels=num_feat,
-            out_channels=num_feat,
-            atten_channels=num_atten,
-            conv=self.conv,
+            in_channels=num_feat, out_channels=num_feat, atten_channels=num_atten
         )
         self.B8 = LKFB(
-            in_channels=num_feat,
-            out_channels=num_feat,
-            atten_channels=num_atten,
-            conv=self.conv,
+            in_channels=num_feat, out_channels=num_feat, atten_channels=num_atten
         )
 
         self.c1 = nn.Conv2d(num_feat * num_block, num_feat, 1, 1, 0)
@@ -301,6 +331,8 @@ class LKFN(nn.Module):
             raise NotImplementedError("Check the Upsampler. None or not support yet.")
 
     def forward(self, input):
+        self.mean = self.mean.type_as(input)
+        input = input - self.mean
         input = torch.cat([input] * self.num_in, dim=1)
         out_fea = self.fea_conv(input)
         out_B1 = self.B1(out_fea)
@@ -319,12 +351,15 @@ class LKFN(nn.Module):
         out_B = self.GELU(out_B)
 
         out_lr = self.c2(out_B) + out_fea
-        output = self.upsampler(out_lr)
+        output = self.upsampler(out_lr) + self.mean
 
         return output
 
 
 if __name__ == "__main__":
     model = LKFN()
-    x = torch.randn(1, 3, 56, 80)
-    print(model(x).shape)
+    model.eval()
+    input = torch.randn(1, 3, 64, 64)
+    output = model(input)
+    print(output.shape)
+    print(output)
