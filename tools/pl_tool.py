@@ -127,6 +127,8 @@ class LightningModule(pl.LightningModule):
             max_lr=self.learning_rate,
             total_steps=self.len_trainloader * self.opt.epochs // len(self.opt.devices),
             pct_start=self.opt.pct_start,
+            anneal_strategy="linear",
+            final_div_factor=1e3,
         )
         return {
             "optimizer": self.optimizer,
@@ -146,10 +148,7 @@ class LightningModule(pl.LightningModule):
         """训练步骤"""
         if self.use_ema and not self.ema_initialized:
             self._init_ema()
-        if isinstance(batch, dict):
-            lr_image, hr_image = (batch["lr_image"], batch["hr_image"])
-        else:
-            lr_image, hr_image = batch[0], batch[1]
+        lr_image, hr_image = (batch["lr_image"], batch["hr_image"])
 
         prediction = self(lr_image)  # 前向传播
         l1_loss = self.l1_loss(prediction, hr_image)  # L1损失
@@ -183,10 +182,7 @@ class LightningModule(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         """验证步骤"""
-        if isinstance(batch, dict):
-            lr_image, hr_image = (batch["lr_image"], batch["hr_image"])
-        else:
-            lr_image, hr_image = batch[0], batch[1]
+        lr_image, hr_image = (batch["lr_image"], batch["hr_image"])
         prediction = self(lr_image)  # 前向传播
         l1_loss = self.l1_loss(prediction, hr_image)  # L1损失
         fft_loss = self.fft_loss(prediction, hr_image)
@@ -226,8 +222,8 @@ class LightningModule(pl.LightningModule):
             prediction = torch.clamp(prediction, 0.0, 1.0)
 
         # 转换为 Y 通道
-        prediction_y = self.rgb_to_y(prediction)
-        hr_image_y = self.rgb_to_y(hr_image)
+        prediction_y = self.rgb_to_y(prediction)[..., 4:-4, 4:-4]
+        hr_image_y = self.rgb_to_y(hr_image)[..., 4:-4, 4:-4]
 
         # 计算 PSNR 和 SSIM
         psnr = tmi.peak_signal_noise_ratio(prediction_y, hr_image_y, data_range=(0, 1))

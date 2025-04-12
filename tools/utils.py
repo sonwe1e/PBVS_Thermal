@@ -2,7 +2,6 @@ import glob
 import torch
 import os
 from PIL import Image
-import torchvision.transforms as transforms
 import numpy as np
 from tqdm import tqdm
 import concurrent.futures  # For multithreading
@@ -11,6 +10,60 @@ from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 import matplotlib.pyplot as plt
 import seaborn as sns
+import inspect
+import torch.nn.functional as F
+
+
+def load_model_from_config(config):
+    """根据配置动态加载模型
+
+    Args:
+        config: 包含模型配置的对象或字典，例如 {'arch': 'mynet', 'upscaling_factor': 2, 'dim': 32, 'n_blocks': 8}
+
+    Returns:
+        加载好的模型实例
+    """
+    try:
+        # 从嵌套配置中获取模型相关参数
+
+        model_config = getattr(config, "model")
+        arch = model_config["arch"]
+
+        # 动态导入模块，模块名为小写形式的 arch
+        module_name = f"tools.models.{arch.lower()}"
+        module = __import__(module_name, fromlist=[arch])
+
+        # 获取模型类
+        model_class = getattr(module, arch)
+
+        # 获取模型构造函数的参数签名
+        sig = inspect.signature(model_class.__init__)
+        valid_params = set(sig.parameters.keys()) - {"self"}  # 排除 'self'
+
+        # 动态获取模型配置中的参数，并过滤出模型支持的部分
+        if isinstance(model_config, dict):
+            kwargs = {
+                key: value
+                for key, value in model_config.items()
+                if key in valid_params and key != "arch"
+            }
+        else:
+            kwargs = {
+                key: getattr(model_config, key)
+                for key in vars(model_config)
+                if key in valid_params and key != "arch"
+            }
+
+        # 实例化模型类，只传递有效参数
+        model = model_class(**kwargs)
+
+        return model
+    except ImportError:
+        raise ValueError(f"不支持的模型架构或模块导入失败: {arch}")
+    except TypeError as e:
+        raise RuntimeError(f"模型 {arch} 实例化失败，可能是参数不匹配: {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"加载模型 {arch} 失败: {e}") from e
 
 
 def load_model(model, model_path):
@@ -31,9 +84,7 @@ def save_image_cv2(img_array, output_path):
     cv2.imwrite(output_path, img_array)
 
 
-def infer_from_model(
-    model, images_path, output_path, tta=False, device="cuda:0", num_workers=16
-):
+def infer_from_model(model, images_path, output_path, tta=False, device="cuda:0"):
     model = model.to(device)
     model.eval()
     if os.path.isdir(images_path):
@@ -45,46 +96,240 @@ def infer_from_model(
         image_files = [images_path]
     os.makedirs(output_path, exist_ok=True)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        for img_path in tqdm(image_files, desc="Inferencing"):
-            img = cv2.imread(img_path, cv2.IMREAD_COLOR)
-            if img is None:
-                print(f"Failed to load {img_path}")
+    for img_path in tqdm(image_files, desc="Inferencing"):
+        img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        if img is None:
+            print(f"Failed to load {img_path}")
+            continue
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
+        img_tensor = torch.from_numpy(img).permute(2, 0, 1) / 255.0
+        img_tensor = img_tensor.unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            if tta:
+                # 原始图像及其旋转版本（0度、90度、180度、270度）
+                base_imgs = [img_tensor]  # 原始图像（无旋转）
+                base_imgs.extend(
+                    torch.rot90(img_tensor, k=i, dims=(2, 3)) for i in range(1, 4)
+                )
+
+                # 创建所有基础图像的水平翻转（dims=3）和垂直翻转（dims=2）
+                hor_flipped_imgs = [torch.flip(img, dims=(3,)) for img in base_imgs]
+
+                # 合并所有增强图像（原始+旋转+水平翻转+垂直翻转）
+                tta_imgs = base_imgs + hor_flipped_imgs
+
+                # 获取模型对所有增强图像的预测
+                tta_outputs = [model(img) for img in tta_imgs]
+
+                # 初始化输出张量
+                output = torch.zeros_like(tta_outputs[0])
+
+                # 处理原始和旋转输出（前4个）
+                for i, out in enumerate(tta_outputs[:4]):
+                    output += torch.rot90(out, k=-i, dims=(2, 3))
+
+                # 处理水平翻转输出（中间4个）
+                for i, out in enumerate(tta_outputs[4:8]):
+                    output += torch.rot90(torch.flip(out, dims=(3,)), k=-i, dims=(2, 3))
+
+                output /= len(tta_outputs)
+            else:
+                output = model(img_tensor)
+
+        # 检查输出范围
+        # print(f"Output range: {output.min():.2f} - {output.max():.2f}")
+        output = (output[0] * 255.0).cpu().numpy().round()
+        output = np.clip(output, 0, 255).astype(np.uint8)
+        output = np.transpose(output, (1, 2, 0))
+
+        img_name = os.path.splitext(os.path.basename(img_path))[0] + ".png"
+        output_file_path = os.path.join(output_path, img_name)
+        save_image_cv2(output, output_file_path)
+
+
+def patch_infer_from_model(
+    model,
+    images_path,
+    output_path,
+    patch_size=256,
+    overlap=128,
+    scale=2,
+    tta=True,
+    batch_size=1,
+    device="cuda:0",
+):
+    # --- Basic Setup ---
+    if batch_size > 1:
+        print(
+            "Warning: batch_size > 1 is not fully implemented for simplicity with overlap/TTA. Using batch_size=1."
+        )
+        batch_size = 1
+
+    if overlap >= patch_size:
+        raise ValueError("Overlap must be less than patch_size.")
+
+    model = model.to(device)
+    model.eval()
+
+    # --- Image Discovery ---
+    if os.path.isdir(images_path):
+        image_files = sorted(
+            glob.glob(os.path.join(images_path, "*.png"))
+            + glob.glob(os.path.join(images_path, "*.jpg"))
+            + glob.glob(os.path.join(images_path, "*.bmp"))
+        )
+    elif os.path.isfile(images_path):
+        image_files = [images_path]
+    else:
+        print(f"Error: Input path {images_path} is not a valid file or directory.")
+        return
+
+    os.makedirs(output_path, exist_ok=True)
+
+    # --- Main Inference Loop ---
+    for img_path in tqdm(image_files, desc="Patch Inferencing"):
+        try:
+            # --- Image Loading and Preprocessing ---
+            img_lq = cv2.imread(img_path, cv2.IMREAD_COLOR)
+            if img_lq is None:
+                print(f"Warning: Failed to load image {img_path}. Skipping.")
                 continue
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img_tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-            img_tensor = img_tensor.unsqueeze(0).to(device)
 
+            img_lq = cv2.cvtColor(img_lq, cv2.COLOR_BGR2RGB)
+            img_lq = img_lq.astype(np.float32) / 255.0
+
+            img_lq_tensor = (
+                torch.from_numpy(img_lq).permute(2, 0, 1).unsqueeze(0).to(device)
+            )
+            b, c, h_lq, w_lq = img_lq_tensor.shape
+
+            # --- Padding Calculation ---
+            stride = patch_size - overlap
+
+            # Calculate padding amounts needed so that image dimensions minus patch_size
+            # become divisible by stride after padding.
+            # Handle cases where h_lq or w_lq might be smaller than patch_size.
+            target_h = h_lq
+            if h_lq < patch_size:
+                target_h = patch_size  # Ensure padded height is at least patch_size
+            else:
+                pad_needed_h = (stride - (h_lq - patch_size) % stride) % stride
+                target_h = h_lq + pad_needed_h
+
+            target_w = w_lq
+            if w_lq < patch_size:
+                target_w = patch_size  # Ensure padded width is at least patch_size
+            else:
+                pad_needed_w = (stride - (w_lq - patch_size) % stride) % stride
+                target_w = w_lq + pad_needed_w
+
+            pad_h = target_h - h_lq  # Total padding for height
+            pad_w = target_w - w_lq  # Total padding for width
+
+            # --- Choose Padding Mode ---
+            # If the original image dimension is smaller than the padding required for 'reflect',
+            # 'reflect' mode will fail. In such cases, switch to 'replicate'.
+            # Check if bottom padding exceeds original height or right padding exceeds original width
+            if pad_h >= h_lq or pad_w >= w_lq:
+                padding_mode = "replicate"  # Safer mode for small images
+                # print(f"Info: Image {os.path.basename(img_path)} smaller than patch/padding. Using '{padding_mode}' mode.") # Optional info
+            else:
+                padding_mode = "reflect"  # Preferred mode when possible
+
+            # --- Apply Padding ---
+            # Pad format is (pad_left, pad_right, pad_top, pad_bottom)
+            # We only pad right and bottom here.
+            img_lq_padded = F.pad(
+                img_lq_tensor, (0, pad_w, 0, pad_h), mode=padding_mode
+            )
+            b, c, h_pad, w_pad = img_lq_padded.shape
+            # print(f"Original size: ({h_lq}, {w_lq}), Padded size: ({h_pad}, {w_pad}), Mode: {padding_mode}") # Debug padding
+
+            # --- Prepare Output Canvas and Weight Map ---
+            output_canvas = torch.zeros(
+                (b, c, h_pad * scale, w_pad * scale), dtype=torch.float32
+            ).to(device)
+            weight_map = torch.zeros(
+                (b, c, h_pad * scale, w_pad * scale), dtype=torch.float32
+            ).to(device)
+
+            # --- Patch Processing ---
             with torch.no_grad():
-                if tta:
-                    tta_imgs = [img_tensor]
-                    tta_imgs.extend(
-                        torch.rot90(img_tensor, k=i, dims=(2, 3)) for i in [1, 2, 3]
-                    )
-                    tta_imgs.extend(torch.flip(img, dims=(3,)) for img in tta_imgs[:])
-                    tta_outputs = [model(img) for img in tta_imgs]
+                for y in range(0, h_pad - patch_size + 1, stride):
+                    for x in range(0, w_pad - patch_size + 1, stride):
+                        input_patch = img_lq_padded[
+                            :, :, y : y + patch_size, x : x + patch_size
+                        ]
 
-                    output = torch.zeros_like(tta_outputs[0])
-                    for i, out in enumerate(tta_outputs[:4]):
-                        output += torch.rot90(out, k=-i % 4, dims=(2, 3))
-                    for i, out in enumerate(tta_outputs[4:]):
-                        output += torch.rot90(
-                            torch.flip(out, dims=(3,)), k=-i % 4, dims=(2, 3)
+                        if tta:
+                            # TTA Logic (same as before)
+                            base_patches = [input_patch]
+                            base_patches.extend(
+                                torch.rot90(input_patch, k=i, dims=(2, 3))
+                                for i in range(1, 4)
+                            )
+                            flipped_patches = [
+                                torch.flip(p, dims=(3,)) for p in base_patches
+                            ]
+                            tta_patches = base_patches + flipped_patches
+                            tta_outputs_patch = [model(p) for p in tta_patches]
+                            patch_output_final = torch.zeros_like(tta_outputs_patch[0])
+                            for i, out_p in enumerate(tta_outputs_patch[:4]):
+                                patch_output_final += torch.rot90(
+                                    out_p, k=-i, dims=(2, 3)
+                                )
+                            for i, out_p in enumerate(tta_outputs_patch[4:]):
+                                patch_output_final += torch.rot90(
+                                    torch.flip(out_p, dims=(3,)), k=-i, dims=(2, 3)
+                                )
+                            patch_output_final /= len(tta_outputs_patch)
+                        else:
+                            patch_output_final = model(input_patch)
+
+                        out_y = y * scale
+                        out_x = x * scale
+                        out_patch_h, out_patch_w = (
+                            patch_output_final.shape[2],
+                            patch_output_final.shape[3],
                         )
-                    output /= 8
-                else:
-                    output = model(img_tensor)
 
-            # 检查输出范围
-            # print(f"Output range: {output.min():.2f} - {output.max():.2f}")
-            output = output[0] * 255.0
-            output = output.clamp(0, 255).cpu().numpy()
-            output = np.transpose(output, (1, 2, 0)).astype(np.uint8)
+                        output_canvas[
+                            :,
+                            :,
+                            out_y : out_y + out_patch_h,
+                            out_x : out_x + out_patch_w,
+                        ] += patch_output_final
+                        weight_map[
+                            :,
+                            :,
+                            out_y : out_y + out_patch_h,
+                            out_x : out_x + out_patch_w,
+                        ] += 1
 
+                output_canvas /= torch.clamp(weight_map, min=1e-8)
+
+            # --- Cropping and Post-processing ---
+            output_final = output_canvas[:, :, 0 : h_lq * scale, 0 : w_lq * scale]
+            output_final = output_final.squeeze(0).cpu().numpy()
+            output_final = np.transpose(output_final, (1, 2, 0))
+            output_final = (
+                np.clip(output_final * 255.0, 0, 255).round().astype(np.uint8)
+            )
+
+            # --- Save Output Image ---
             img_name = os.path.splitext(os.path.basename(img_path))[0] + ".png"
             output_file_path = os.path.join(output_path, img_name)
-            executor.submit(save_image_cv2, output, output_file_path)
-        executor.shutdown(wait=True)
+            save_image_cv2(output_final, output_file_path)
+
+        except Exception as e:
+            print(f"Error processing {img_path}: {e}")
+            import traceback
+
+            traceback.print_exc()  # Print full traceback for debugging
+            continue
+
+    print("Patch-based inference completed.")
 
 
 def calculate_metrics(gt_img, pred_img):

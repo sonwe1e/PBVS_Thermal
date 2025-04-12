@@ -450,7 +450,7 @@ class LRSA(nn.Module):
         return x
 
 
-class CATANet(nn.Module):
+class CATANET(nn.Module):
     setting = dict(
         dim=40,
         block_num=8,
@@ -578,6 +578,6 @@ class CATANet(nn.Module):
 
 
 if __name__ == "__main__":
-    model = CATANet(upscale=3).cuda()
+    model = CATANET(upscale=3).cuda()
     x = torch.randn(2, 3, 128, 128).cuda()
     print(model(x).shape)

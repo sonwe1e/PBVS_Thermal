@@ -169,18 +169,12 @@ class ImageDataset(data.Dataset):
         load_extra_to_memory (bool): Whether to preload extra datasets to memory (default: False).
     """
 
-    def __init__(
-        self,
-        phase: str,
-        options,
-        load_to_memory: bool = True,
-        load_extra_to_memory: bool = False,
-    ):
+    def __init__(self, phase: str, options):
         self.phase = phase
         self.options = options
-        self.scale = options.upscaling_factor
-        self.load_to_memory = load_to_memory
-        self.load_extra_to_memory = load_extra_to_memory
+        self.scale = options.model["upscaling_factor"]
+        self.load_to_memory = options.load_to_memory
+        self.load_extra_to_memory = options.load_extra_to_memory
 
         # Main data paths
         self.hr_path = (
@@ -214,10 +208,8 @@ class ImageDataset(data.Dataset):
         self.image_names: List[Tuple[str, str, str]] = []  # (name, hr_path, lr_path)
         self._collect_image_names()
 
-        self.repeat = 10 if phase == "train" else 1
-        self.memory_cache: Dict[
-            str, Tuple[np.ndarray, np.ndarray]
-        ] = {}  # {image_name: (lr_img, hr_img)}
+        self.repeat = options.repeat if phase == "train" else 1
+        self.memory_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
 
         # Load data to memory if enabled
         self._preload_to_memory()
@@ -295,7 +287,8 @@ class ImageDataset(data.Dataset):
     def _augment(
         self, lr_img: np.ndarray, hr_img: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Applies random augmentation (rotation and flips)."""
+        """Applies random augmentation (rotation, flips, and blurs)."""
+        # Geometric transforms
         if random.random() < 0.5:
             rotations = random.randint(0, 3)
             lr_img, hr_img = map(lambda x: np.rot90(x, rotations), (lr_img, hr_img))
@@ -345,12 +338,8 @@ class ImageDataset(data.Dataset):
 
 def get_dataloader(options):
     """Creates and returns prefetching data iterators and raw dataloaders."""
-    train_dataset = ImageDataset(
-        "train", options, load_to_memory=True, load_extra_to_memory=False
-    )
-    valid_dataset = ImageDataset(
-        "valid", options, load_to_memory=True, load_extra_to_memory=False
-    )
+    train_dataset = ImageDataset("train", options)
+    valid_dataset = ImageDataset("valid", options)
 
     train_dataloader = PrefetchDataLoader(
         max_queue_size=4,

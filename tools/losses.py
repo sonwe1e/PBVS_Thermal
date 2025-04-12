@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import lpips
 import torch.nn.functional as F
 
 
