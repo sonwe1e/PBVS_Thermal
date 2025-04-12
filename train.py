@@ -6,6 +6,7 @@ import lightning.pytorch as pl
 from lightning.pytorch.loggers import WandbLogger
 import wandb
 import os
+from tools.utils import load_model_from_config
 
 torch.set_float32_matmul_precision("high")
 
@@ -13,55 +14,7 @@ torch.set_float32_matmul_precision("high")
 if __name__ == "__main__":
     opt = get_option()
     """定义网络"""
-    from tools.models.smfanet import *
-    from tools.models.pnet import PNet
-    from tools.models.scnet import SCNet
-    from tools.models.lkfn import LKFN
-    from tools.models.competition_backup import FusionNet
-    from tools.models.mynet import FusionNet
-    from tools.models.efdn import EFDN
-    from tools.models.catanet import CATANet
-    from tools.models.swinir import SwinIR
-    from tools.models.esrt import ESRT
-
-    # model = ESRT(upscale=2)
-    # model = FusionNet(
-    #     dim=opt.dim,
-    #     n_blocks=opt.n_blocks,
-    #     upscaling_factor=opt.upscaling_factor,
-    #     fmb_params={
-    #         "smfa_growth": opt.smfa_growth,
-    #         "pcfn_growth": opt.pcfn_growth,
-    #         "snfa_dropout": opt.snfa_dropout,
-    #         "pcfn_dropout": opt.pcfn_dropout,
-    #         "p_rate": opt.p_rate,
-    #     },
-    # )
-    # model = Ensemble()
-    model = LKFN()
-    # model = PNet()
-    # model = SCNet()
-    # model = EFDN()
-    # model = FusionNet(
-    #     dim=opt.dim,
-    #     n_blocks=opt.n_blocks,
-    #     upscaling_factor=opt.upscaling_factor,
-    # )
-    # model = CATANet(upscale=opt.upscaling_factor)
-    # window_size = 8
-    # height = (128 // opt.upscaling_factor // window_size + 1) * window_size
-    # width = (128 // opt.upscaling_factor // window_size + 1) * window_size
-    # model = SwinIR(
-    #     upscale=opt.upscaling_factor,
-    #     img_size=(height, width),
-    #     window_size=window_size,
-    #     img_range=1.0,
-    #     depths=[6, 6, 6, 6],
-    #     embed_dim=60,
-    #     num_heads=[6, 6, 6, 6],
-    #     mlp_ratio=2,
-    #     upsampler="pixelshuffledirect",
-    # )
+    model = load_model_from_config(opt)
     """模型编译"""
     # model = torch.compile(model)
     """导入数据集"""
